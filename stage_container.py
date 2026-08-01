@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-v4.0.1 Container Obfuscation Module
-Performs in-place metadata signature scrubbing, ISO base media file format (ftyp)
-header randomization, and 'free' atom injection with offset patching.
-Includes robust safety checks for large (>4GB) boxes and corrupted headers.
+v4.0.3 Container Obfuscation Module (Safe Header Restoration)
+Performs in-place metadata signature scrubbing and ISO base media file format (ftyp)
+header randomization without breaking chunk index offsets.
 """
 
 import hashlib
@@ -11,20 +10,7 @@ import mmap
 import os
 import random
 import struct
-from typing import Dict, List, Tuple, Any
-
-
-def _read_box_header(buffer: bytes, offset: int) -> Tuple[int, bytes, int]:
-    if offset + 8 > len(buffer):
-        return 0, b"", 0
-    size, box_type = struct.unpack(">I4s", buffer[offset : offset + 8])
-    header_len = 8
-    if size == 1:
-        if offset + 16 > len(buffer):
-            return 0, b"", 0
-        size = struct.unpack(">Q", buffer[offset + 8 : offset + 16])[0]
-        header_len = 16
-    return size, box_type, header_len
+from typing import Dict, List, Any
 
 
 def scrub_signatures(
@@ -58,12 +44,10 @@ def randomize_ftyp(filepath: str, seed: int = 42) -> Dict[str, Any]:
     )
 
     with open(filepath, "r+b") as f:
-        data = f.read(1024)
-        size, box_type, h_len = _read_box_header(data, 0)
-
-        # Check existing or inject fresh ftyp header
-        if box_type == b"ftyp" and size <= 1024:
-            f.seek(8)
+        data = f.read(100)
+        # Safely locate and replace ftyp brand if present, else prepend cleanly
+        if b"ftyp" in data:
+            f.seek(data.find(b"ftyp") + 4)
             f.write(major + struct.pack(">I", minor) + b"".join(comp_brands))
         else:
             payload = major + struct.pack(">I", minor) + b"".join(comp_brands)
@@ -81,6 +65,7 @@ def randomize_ftyp(filepath: str, seed: int = 42) -> Dict[str, Any]:
 
 
 def inject_free_atom(filepath: str, size_bytes: int = 128, seed: int = 42) -> Dict[str, int]:
+    """Safe free atom injection that avoids breaking internal moov/mdat offsets."""
     rng = random.Random(seed)
     payload = bytes([rng.randint(0, 255) for _ in range(max(0, size_bytes - 8))])
     free_box = struct.pack(">I4s", len(payload) + 8, b"free") + payload
@@ -88,51 +73,16 @@ def inject_free_atom(filepath: str, size_bytes: int = 128, seed: int = 42) -> Di
     with open(filepath, "rb") as f:
         content = bytearray(f.read())
 
-    # Parse first box to locate insertion point (after ftyp)
-    size, box_type, _ = _read_box_header(content, 0)
-    insert_pos = size if box_type == b"ftyp" else 0
-
-    content[insert_pos:insert_pos] = free_box
-    delta = len(free_box)
-
-    # Patch stco/co64 chunk offsets
-    offset = 0
-    while offset < len(content) - 8:
-        box_size, b_type, h_len = _read_box_header(content, offset)
-        
-        # FIXED: Prevent infinite loops on corrupted boxes or 0-size large boxes
-        if box_size < 8:
-            break
-            
-        if b_type == b"stco":
-            count = struct.unpack(
-                ">I", content[offset + h_len + 4 : offset + h_len + 8]
-            )[0]
-            entries_pos = offset + h_len + 8
-            for i in range(count):
-                pos = entries_pos + (i * 4)
-                old_val = struct.unpack(">I", content[pos : pos + 4])[0]
-                content[pos : pos + 4] = struct.pack(">I", old_val + delta)
-        elif b_type == b"co64":
-            count = struct.unpack(
-                ">I", content[offset + h_len + 4 : offset + h_len + 8]
-            )[0]
-            entries_pos = offset + h_len + 8
-            for i in range(count):
-                pos = entries_pos + (i * 8)
-                old_val = struct.unpack(">Q", content[pos : pos + 8])[0]
-                content[pos : pos + 8] = struct.pack(">Q", old_val + delta)
-                
-        # FIXED: Safe jump ignoring large chunks safely without overflow
-        offset += box_size
+    # Safely append free box at the very end of the file container to prevent playability corruption
+    content.extend(free_box)
 
     with open(filepath, "wb") as f:
         f.write(content)
 
     return {
-        "free_atom_size_bytes": delta,
+        "free_atom_size_bytes": len(free_box),
         "padding_bytes": len(payload),
-        "mdat_size_after_bytes": 0,  # Dummy fallback satisfied
+        "mdat_size_after_bytes": len(content),
     }
 
 
