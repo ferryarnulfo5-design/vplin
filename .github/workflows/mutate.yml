@@ -1,63 +1,67 @@
-name: media-mutation-pipeline
+name: Production Media Mutation Pipeline v4.0.1
 
 on:
   workflow_dispatch:
     inputs:
-      input_path:
-        description: 'Source video: repo path (e.g. sample/input.mp4) or public https URL'
+      media_url:
+        description: 'Direct download URL for input MP4'
         required: true
-        default: 'sample/input.mp4'
-      verify:
-        description: 'Run PSNR/SSIM + forensic verification'
-        type: boolean
-        default: true
-      baseline:
-        description: 'Encode clean baseline to measure true PSNR drop (adds ~5-8 min)'
-        type: boolean
-        default: false
-
-permissions:
-  contents: read
-
-concurrency:
-  group: mutate-${{ github.ref }}
-  cancel-in-progress: true
+        default: 'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_1MB.mp4'
+      preset:
+        description: 'Mutation Aggressiveness Level'
+        required: true
+        default: 'standard'
+        type: choice
+        options:
+          - transparent
+          - standard
+          - aggressive
+      seed:
+        description: 'Deterministic RNG Seed'
+        required: false
+        default: '42'
+  push:
+    paths:
+      - '**.py'
+      - '.github/workflows/mutate.yml'
+  schedule:
+    - cron: '0 0 * * 0'
 
 jobs:
   mutate:
-    runs-on: ubuntu-latest            # 2-core / ~7 GB / 120-min limit
-    timeout-minutes: 110              # safety margin under the 120-min cap
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
 
-      - name: Ensure ffmpeg
+      - name: Install System Dependencies
         run: |
-          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
-          ffmpeg -version | head -1
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libchromaprint-tools python3-pip
 
-      - name: Resolve input
+      - name: Install Python Verification Dependencies (PEP 668 Fixed)
         run: |
-          INPUT="${{ github.event.inputs.input_path }}"
-          if [[ "$INPUT" =~ ^https?:// ]]; then
-            curl -fL --retry 3 -o input.mp4 "$INPUT"
-          else
-            cp "$INPUT" input.mp4
-          fi
-          ls -lh input.mp4
-          ffprobe -v error -show_entries format=duration -of default=nw=1 input.mp4
+          pip install --upgrade pip --break-system-packages
+          pip install pillow imagehash --break-system-packages
 
-      - name: Run mutation pipeline
+      - name: Fetch Input Video Asset
         run: |
-          ARGS="input.mp4 out --verify --seed ${{ github.run_id }}"
-          if [[ "${{ github.event.inputs.baseline }}" == "true" ]]; then
-            ARGS="$ARGS --baseline"
-          fi
-          python3 pipeline.py $ARGS
+          curl -L "${{ github.event.inputs.media_url || 'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_1MB.mp4' }}" -o input.mp4
 
-      - name: Upload artifacts
+      - name: Execute Cryptographic Mutation Pipeline
+        run: |
+          python3 pipeline.py input.mp4 output.mp4 \
+            --preset "${{ github.event.inputs.preset || 'standard' }}" \
+            --seed "${{ github.event.inputs.seed || '42' }}" \
+            --verify \
+            --low-cpu
+
+      - name: Upload Processed Video Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mutated-video
-          path: out/
-          if-no-files-found: error
-          retention-days: 14
+          name: processed-video
+          path: |
+            output.mp4
+            manifest.json
+          retention-days: 30
