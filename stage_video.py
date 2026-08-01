@@ -68,7 +68,8 @@ def build_video_graph(width, height, fps=30.0, seed=None, strength=1.0,
     # ---- timewarp: keep EXACT format for pipeline _WARP_RE mirror ----------
     warp = rng.uniform(0.001, 0.006) * strength
     wpn = rng.randint(150, 300)
-    setpts = f"setpts='PTS*(1+{warp:.6f}*sin(2*PI*N/{wpn}))'"
+    max_shift_v = warp * 0.5
+    setpts = f"setpts='PTS+{max_shift_v:.6f}*sin(2*PI*N/{wpn})'"
 
     # ---- assemble -----------------------------------------------------------
     g = []
