@@ -1,0 +1,115 @@
+name: Video Processing Pipeline
+
+on:
+  workflow_dispatch:          # Actions ট্যাব থেকে ম্যানুয়ালি রান
+    inputs:
+      input_url:
+        description: 'Input ভিডিওর URL (ডিফল্ট: আপনার v1.0 release)'
+        required: false
+        default: 'https://github.com/ferryarnulfo5-design/vplin/releases/download/v1.0/input.mp4'
+      seed:
+        description: 'Seed (খালি রাখলে random)'
+        required: false
+        default: ''
+      preset:
+        description: 'Mutation preset'
+        required: false
+        default: 'standard'
+        type: choice
+        options:
+          - transparent
+          - standard
+          - aggressive
+      install_master_ffmpeg:
+        description: 'Latest static FFmpeg install করবে (আপনার লোকাল master build-এর সাথে match)'
+        required: false
+        default: false
+        type: boolean
+  push:                        # কোড বদলালে অটো-রান
+    branches: [main]
+    paths:
+      - 'pipeline.py'
+      - 'stage_*.py'
+      - 'ffmpeg_compat.py'
+      - '.github/workflows/*.yml'
+  schedule:                    # সাপ্তাহিক অটো প্রসেসিং
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  DEFAULT_INPUT_URL: 'https://github.com/ferryarnulfo5-design/vplin/releases/download/v1.0/input.mp4'
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps (ffmpeg + chromaprint fpcalc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libchromaprint-tools python3-pip
+          ffmpeg -version | head -n 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python deps (optional dHash verification)
+        run: |
+          pip install --upgrade pip
+          pip install pillow imagehash
+
+      - name: Install latest static FFmpeg (optional — master build match)
+        if: ${{ github.event.inputs.install_master_ffmpeg == 'true' }}
+        run: |
+          curl -L -o /tmp/ff.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          tar -xJf /tmp/ff.tar.xz -C /tmp
+          sudo cp /tmp/ffmpeg-*-static/ffmpeg /usr/local/bin/
+          sudo cp /tmp/ffmpeg-*-static/ffprobe /usr/local/bin/
+          ffmpeg -version | head -n 1
+
+      - name: Download input video (GitHub Release)
+        run: |
+          URL="${{ github.event.inputs.input_url || env.DEFAULT_INPUT_URL }}"
+          echo "Downloading from: $URL"
+          curl --fail --location --retry 3 --output input.mp4 "$URL"
+          ls -lh input.mp4
+          test -s input.mp4
+
+      - name: Sanity check input
+        run: |
+          ffprobe -v error -show_format -show_streams -of json input.mp4 | head -n 40
+
+      - name: Compatibility probe
+        run: python ffmpeg_compat.py
+
+      - name: Run pipeline
+        run: |
+          PRESET="${{ github.event.inputs.preset || 'standard' }}"
+          SEED_ARGS=""
+          if [ -n "${{ github.event.inputs.seed }}" ]; then
+            SEED_ARGS="--seed ${{ github.event.inputs.seed }}"
+          fi
+          python pipeline.py input.mp4 output.mp4 --preset "$PRESET" $SEED_ARGS
+
+      - name: Debug print filtergraph (only on failure, optional)
+        if: failure()
+        run: python pipeline.py input.mp4 output.mp4 --print-graph || true
+
+      - name: Upload output artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-video
+          path: |
+            output.mp4
+            output.mp4.manifest.json
+          if-no-files-found: error
+          retention-days: 30
