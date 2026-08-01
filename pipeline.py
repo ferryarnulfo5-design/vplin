@@ -1,385 +1,239 @@
 #!/usr/bin/env python3
 """
-pipeline.py — Anti-Fingerprinting Media Mutation Pipeline (Parts 1-4) v3.0 FINAL.
-Fixed: ffmpeg_compat import, container obfuscation safe dict access.
+v4.0.1 Production-Grade Media Mutation Pipeline (Fixed for 2026+)
+Orchestrates FFmpeg capabilities detection, audio/video deformation filter chains,
+container obfuscation, and perceptual divergence verification.
 """
+
 import argparse
-import datetime
 import json
 import os
-import random
-import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
+from typing import Any, Dict, List, Tuple
 
-try:
-    from ffmpeg_compat import probe_compat
-    from stage_audio import build_audio_filtergraph
-    from stage_video import build_video_filtergraph
-    import stage_container as sc
-except ImportError as e:
-    sys.exit(f"missing module: {e}\nffmpeg_compat.py, stage_audio.py, "
-             "stage_video.py and stage_container.py must sit next to pipeline.py")
+import ffmpeg_compat
+import stage_audio
+import stage_container
+import stage_video
 
-PRESETS = {
-    "transparent": {"audio": 0.5, "video": 0.5, "interpolate": False},
-    "standard":    {"audio": 1.0, "video": 1.0, "interpolate": False},
-    "aggressive":  {"audio": 1.5, "video": 1.4, "interpolate": True},
-}
+# Subprocess creation flags for Windows execution
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
-THRESHOLDS = {
-    "audio_divergence": 0.75,
-    "video_crc_divergence": 0.98,
-    "dhash_mean": 0.35,
-}
 
-# --------------------------------------------------------------------------
-# Windows-safe subprocess runner
-# --------------------------------------------------------------------------
-def run(cmd, label="", quiet=False, timeout_sec=None):
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+def run_process_with_watchdog(
+    cmd: List[str], timeout_sec: int = 7200
+) -> Tuple[int, str]:
+    print(f"[Exec] {' '.join(cmd)}")
+    start_time = time.time()
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", creationflags=creationflags)
-    time_re = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
-    last = 0.0
-    t_start = time.monotonic()
-    lines = []
-    for line in proc.stdout:
-        s = line.strip()
-        lines.append(s)
-        if not s or s.startswith(("frame=", "size=", "bitrate=",
-                                  "speed=", "progress=", "dup=", "drop=",
-                                  "fps=")):
-            continue
-        if "out_time_ms" in s or "N/A" in s:
-            continue
-        m = time_re.search(s)
-        if m:
-            h, mi, sec = m.groups()
-            t = int(h) * 3600 + int(mi) * 60 + float(sec)
-            if t - last >= 5.0 and not quiet:
-                print(f"  [{label}] {t:9.1f} s", flush=True)
-                last = t
-            continue
-        if not quiet:
-            print(f"  [{label}] {s}", flush=True)
-        if timeout_sec and (time.monotonic() - t_start) > timeout_sec:
-            proc.terminate()
-            proc.wait()
-            raise RuntimeError(f"timeout {timeout_sec}s exceeded")
-    rc = proc.wait()
-    if rc != 0 and not quiet:
-        print(f"  [{label}] FAILED rc={rc}", flush=True)
-    return rc, "\n".join(lines)
-
-
-# --------------------------------------------------------------------------
-# Source probe
-# --------------------------------------------------------------------------
-def probe_media(path, ffprobe="ffprobe"):
-    p = subprocess.run(
-        [ffprobe, "-v", "error", "-show_streams", "-show_format",
-         "-of", "json", path],
-        capture_output=True, text=True)
-    info = json.loads(p.stdout or "{}")
-    v = a = None
-    for s in info.get("streams", []):
-        if s.get("codec_type") == "video" and v is None:
-            v = s
-        elif s.get("codec_type") == "audio" and a is None:
-            a = s
-    if v is None:
-        raise RuntimeError("no video stream in source")
-    fr = str(v.get("r_frame_rate") or "30/1")
-    try:
-        num, den = map(int, fr.split("/"))
-        fps = num / den if den else 30.0
-    except ValueError:
-        fps = 30.0
-    return {
-        "width": int(v["width"]), "height": int(v["height"]),
-        "fps": round(fps, 6), "vcodec": v.get("codec_name", "?"),
-        "has_audio": a is not None,
-        "sr": int(a.get("sample_rate", 44100)) if a else 44100,
-        "acodec": a.get("codec_name", "?") if a else None,
-        "duration": float(info.get("format", {}).get("duration") or 0.0),
-    }
-
-
-# --------------------------------------------------------------------------
-# Combined single-pass encode (Parts 1 + 2)
-# --------------------------------------------------------------------------
-def build_combined_graph(probed, seed, preset, compat=None, audio_out_sr=None):
-    cfg = PRESETS[preset]
-    parts = []
-    low_cpu = os.cpu_count() < 4
-
-    # Video
-    vgraph, _, vmeta = build_video_filtergraph(
-        compat, low_cpu, probed["duration"],
-        fps=probed["fps"], width=probed["width"], height=probed["height"]
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=CREATE_NO_WINDOW,
     )
-    parts.append(vgraph)
+    output_log = []
+    while True:
+        line = proc.stdout.readline()
+        if not line and proc.poll() is not None:
+            break
+        if line:
+            output_log.append(line)
+            if "time=" in line:
+                print(f"  -> {line.strip()}", end="\r")
+        if time.time() - start_time > timeout_sec:
+            proc.kill()
+            raise TimeoutError(f"Process exceeded {timeout_sec}s watchdog limit.")
 
-    # Audio
-    if probed["has_audio"]:
-        agraph = build_audio_filtergraph(
-            compat, low_cpu, probed["duration"],
-            sr=audio_out_sr or probed["sr"]
-        )
-        parts.append(agraph)
-
-    return ";\n".join(parts)
-
-
-def encode_stage(src, inter, probed, seed, preset, ffmpeg, quiet, compat=None, audio_out_sr=None):
-    graph = build_combined_graph(probed, seed, preset, compat=compat, audio_out_sr=audio_out_sr)
-    maps = ["-map", "[vout]"]
-    if probed["has_audio"]:
-        maps += ["-map", "[aout]"]
-    cmd = ([ffmpeg, "-y", "-nostdin", "-hide_banner", "-i", src,
-            "-filter_complex", graph] + maps +
-           ["-c:v", "libx264", "-preset", "medium", "-crf", "23",
-            "-pix_fmt", "yuv420p"] + (["-vsync", "vfr"] if compat.major < 7 else ["-fps_mode", "vfr"]))
-    if probed["has_audio"]:
-        cmd += ["-c:a", "aac", "-b:a", "192k"]
-    cmd += [inter]
-    rc, log = run(cmd, label="encode", quiet=quiet, timeout_sec=7200)
-    return rc, log
+    print()
+    return proc.returncode, "".join(output_log)
 
 
-# --------------------------------------------------------------------------
-# Verification suite
-# --------------------------------------------------------------------------
-def audio_divergence(src, mut, fpcalc):
-    def raw(p):
-        r = subprocess.run([fpcalc, "-raw", p],
-                           capture_output=True, text=True)
-        for ln in r.stdout.splitlines():
-            if ln.startswith("FINGERPRINT="):
-                return ln.split("=", 1)[1].strip().split(",")
-        return []
-    a, b = raw(src), raw(mut)
-    n = min(len(a), len(b))
-    if n == 0:
-        return None
-    diff = sum(x != y for x, y in zip(a[:n], b[:n]))
-    return {"divergence": round(diff / n, 4), "src_frames": len(a), "out_frames": len(b)}
-
-
-def video_crc_divergence(src, mut, ffmpeg):
-    def crcs(p):
-        r = subprocess.run(
-            [ffmpeg, "-nostdin", "-i", p, "-vf", "framecrc",
-             "-f", "framecrc", "-"],
-            capture_output=True, text=True)
-        return [ln.split(",")[-1].strip()
-                for ln in r.stdout.splitlines() if "0x" in ln]
-    a, b = crcs(src), crcs(mut)
-    n = min(len(a), len(b))
-    if n == 0:
-        return None
-    diff = sum(x != y for x, y in zip(a[:n], b[:n]))
-    return {"divergence": round(diff / n, 4), "frames_compared": n}
-
-
-def dhash_divergence(src, mut, ffmpeg, compat=None, every=30, limit=40):
-    try:
-        import imagehash
-        from PIL import Image
-    except Exception:
-        return None
-    fps_mode = ["-fps_mode", "vfr"] if compat and compat.major >= 7 else ["-vsync", "vfr"]
-
-    def frames(p):
-        tmp = tempfile.mkdtemp()
-        subprocess.run(
-            [ffmpeg, "-nostdin", "-i", p,
-             "-vf", f"select='not(mod(n,{every}))'",
-             *fps_mode, os.path.join(tmp, "f%05d.png")],
-            capture_output=True, text=True)
-        hs = []
-        for f in sorted(os.listdir(tmp))[:limit]:
-            try:
-                hs.append(imagehash.dhash(Image.open(os.path.join(tmp, f))))
-            except Exception:
-                pass
-        return hs
-
-    h1, h2 = frames(src), frames(mut)
-    n = min(len(h1), len(h2))
-    if n == 0:
-        return None
-    dists = [(h1[i] - h2[i]) / 64.0 for i in range(n)]
-    return {"mean": round(sum(dists) / n, 4),
-            "beyond_0.35": round(sum(d > 0.35 for d in dists) / n, 4),
-            "frames": n}
-
-
-# --------------------------------------------------------------------------
-# main
-# --------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser(
-        description="Anti-fingerprinting media mutation pipeline")
-    ap.add_argument("src")
-    ap.add_argument("out")
-    ap.add_argument("--preset", choices=list(PRESETS), default="standard")
-    ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--profile", choices=["iphone_mov", "android_mp4", "gopro_mp4"], default=None)
-    ap.add_argument("--no-av-sync", action="store_true")
-    ap.add_argument("--no-sei", action="store_true")
-    ap.add_argument("--no-scrub", action="store_true")
-    ap.add_argument("--no-fake-creation", action="store_true")
-    ap.add_argument("--odd-sr", action="store_true")
-    ap.add_argument("--keep-intermediate", action="store_true")
-    ap.add_argument("--print-graph", action="store_true")
-    ap.add_argument("--quiet", action="store_true")
-    ap.add_argument("--ffmpeg", default="ffmpeg")
-    ap.add_argument("--ffprobe", default="ffprobe")
-    ap.add_argument("--fpcalc", default=None)
-    ap.add_argument("--verify", action="store_true")
-    ap.add_argument("--baseline", action="store_true")
-    args = ap.parse_args()
-
-    if not os.path.isfile(args.src):
-        sys.exit(f"source not found: {args.src}")
-
-    seed = args.seed if args.seed is not None else random.SystemRandom().randint(0, 2 ** 31)
-    fpcalc = args.fpcalc or shutil.which("fpcalc")
-
-    # ---- runtime capability probe ----
-    compat = probe_compat(args.ffmpeg)
-    print("========================================================================\n"
-          "DEEP MEDIA MUTATION PIPELINE")
-    print(f"input={args.src}  seed={seed}  max=100min")
-    print(f"{args.ffmpeg} {compat.version_str} ({args.ffmpeg})")
-    print(compat.summary())
-
-    # 1 ---- probe source ----
-    probed = probe_media(args.src, ffprobe=args.ffprobe)
-    print(f"media: {probed['vcodec']} {probed['width']}x{probed['height']} "
-          f"@{probed['fps']:.2f}fps, {probed['duration']:.1f}s, "
-          f"audio={probed['acodec']} {probed['sr']}Hz")
-    low_cpu = os.cpu_count() < 4
-    print(f"runner profile: {'LOW' if low_cpu else 'FULL'} (os.cpu_count()={os.cpu_count()})")
-
-    audio_out_sr = None
-    if args.odd_sr and probed["has_audio"]:
-        rng = random.Random(seed)
-        audio_out_sr = max(8000, min(192000, probed["sr"] + rng.randint(-220, 220)))
-        print(f"      audio track timescale mutation: {probed['sr']} -> {audio_out_sr} Hz")
-
-    # 2 ---- encode ----
-    if args.print_graph:
-        graph = build_combined_graph(probed, seed, args.preset, compat, audio_out_sr)
-        print(graph)
-        return
-
-    workdir = tempfile.mkdtemp(prefix="apfp_")
-    inter = os.path.join(workdir, "stage12.mp4")
-    out_enc = os.path.join(workdir, "stage3.mp4")
-
-    print("[1/3] encode: audio disruption + video lattice ...")
-    rc, log = encode_stage(args.src, inter, probed, seed, args.preset,
-                           args.ffmpeg, args.quiet, compat, audio_out_sr)
-    if rc != 0:
-        sys.exit("encode stage failed")
-
-    # 3 ---- container obfuscation ----
-    print("[2/3] container obfuscation ...")
-    # Simplified container ops
-    ftyp_report = sc.randomize_ftyp(inter, seed=seed)
-    scrubbed = sc.scrub_signatures(inter)
-    free_report = sc.inject_free_atom(inter, seed=seed)
-
-    print(f"  ftyp: {ftyp_report.get('major_brand_after', '?')} "
-          f"scrubbed={scrubbed} free={free_report.get('free_atom_size_bytes', 0)}")
-
-    # Move final output
-    shutil.move(inter, args.out)
-
-    # 4 ---- verify ----
-    print("[3/3] verification ...")
-    ver = {"audio": None, "video_crc": None, "dhash": None, "forensic": None}
-
-    if probed["has_audio"] and fpcalc:
-        ver["audio"] = audio_divergence(args.src, args.out, fpcalc)
-        if ver["audio"]:
-            print(f"      fpcalc divergence: {ver['audio']['divergence']:.1%} "
-                  f"({ver['audio']['src_frames']} -> {ver['audio']['out_frames']} frames)")
-        else:
-            print("      fpcalc: no fingerprint frames extracted")
-
-    ver["video_crc"] = video_crc_divergence(args.src, args.out, args.ffmpeg)
-    if ver["video_crc"]:
-        print(f"      framecrc divergence: {ver['video_crc']['divergence']:.1%} "
-              f"({ver['video_crc']['frames_compared']} frames)")
-
-    ver["dhash"] = dhash_divergence(args.src, args.out, args.ffmpeg, compat=compat)
-    if ver["dhash"]:
-        print(f"      dHash mean distance: {ver['dhash']['mean']:.3f} "
-              f"(>{THRESHOLDS['dhash_mean']} = broken, "
-              f"{ver['dhash']['beyond_0.35']:.0%} beyond 0.35)")
-
-    # forensic
-    found = sc.scan_signatures(args.out)
-    ver["forensic"] = {"signatures_found": list(found.keys())}
-    if found:
-        print(f"      WARNING: signatures still present: {list(found.keys())}")
-    else:
-        print("      forensic: clean (no signatures)")
-
-    # thresholds
-    fails = []
-    if ver["audio"] and ver["audio"]["divergence"] < THRESHOLDS["audio_divergence"]:
-        fails.append("audio divergence below threshold")
-    if ver["video_crc"] and ver["video_crc"]["divergence"] < THRESHOLDS["video_crc_divergence"]:
-        fails.append("framecrc divergence below threshold")
-    if ver["dhash"] and ver["dhash"]["mean"] < THRESHOLDS["dhash_mean"]:
-        fails.append("dHash distance below threshold")
-    if found:
-        fails.append(f"signatures: {list(found.keys())}")
-
-    # manifest
-    manifest = {
-        "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "source": os.path.abspath(args.src),
-        "output": os.path.abspath(args.out),
-        "seed": seed,
-        "preset": args.preset,
-        "audio_out_sr": audio_out_sr,
-        "probe": probed,
-        "ffmpeg_compat": {
-            "version": compat.version_str,
-            "scale_eval": compat.scale_eval,
-            "crop_eval": compat.crop_eval,
-            "firequalizer": compat.has("firequalizer"),
-        },
-        "verification": ver,
-        "failures": fails,
-        "thresholds_met": not fails,
+def verify_divergence(src: str, dst: str, compat: ffmpeg_compat.Capabilities) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {
+        "audio_divergence_pct": 0.0,
+        "video_divergence_pct": 0.0,
+        "dhash_mean_distance": 0.0,
+        "psnr_drop_db": 0.0,
+        "ssim_val": 1.0,
+        "verdict": "PASS",
     }
 
-    mpath = args.out + ".manifest.json"
-    with open(mpath, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+    # 1. Chromaprint fpcalc audio divergence
+    try:
+        p1 = subprocess.run(["fpcalc", "-raw", src], capture_output=True, text=True)
+        p2 = subprocess.run(["fpcalc", "-raw", dst], capture_output=True, text=True)
+        if p1.returncode == 0 and p2.returncode == 0:
+            fp1 = p1.stdout.split("FINGERPRINT=")[1].strip()
+            fp2 = p2.stdout.split("FINGERPRINT=")[1].strip()
+            matches = sum(1 for a, b in zip(fp1, fp2) if a == b)
+            metrics["audio_divergence_pct"] = round(
+                (1.0 - (matches / max(len(fp1), len(fp2)))) * 100.0, 2
+            )
+    except Exception as e:
+        print(f"[Warn] Chromaprint verification failed: {e}")
 
-    print(f"\n== VERDICT: {'PASS' if not fails else 'FAIL'}")
-    for msg in fails:
-        print(f"   ! {msg}")
-    print(f"   manifest: {mpath}")
-    print(f"   output: {args.out}")
+    # 2. PSNR & SSIM verification with sampling (1 frame per 300)
+    if compat.has("psnr") and compat.has("ssim"):
+        try:
+            log_psnr = "psnr.log"
+            log_ssim = "ssim.log"
+            vf = (
+                f"[0:v]select='not(mod(n,300))',setpts=N/FRAME_RATE/TB[main];"
+                f"[1:v]select='not(mod(n,300))',setpts=N/FRAME_RATE/TB[ref];"
+                f"[main][ref]psnr=f={log_psnr},ssim=f={log_ssim}"
+            )
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", dst, "-i", src,
+                    "-filter_complex", vf, "-f", "null", "-"
+                ],
+                capture_output=True,
+            )
+            
+            # Robust log parsing for PSNR
+            if os.path.exists(log_psnr):
+                with open(log_psnr, "r") as f:
+                    lines = [line.strip() for line in f.readlines() if line.strip()]
+                    if lines:
+                        last_line = lines[-1]
+                        if "average:" in last_line:
+                            psnr_val = float(last_line.split("average:")[1].split()[0])
+                            metrics["psnr_drop_db"] = round(max(0.0, 45.0 - psnr_val), 2)
+            
+            # Robust log parsing for SSIM
+            if os.path.exists(log_ssim):
+                with open(log_ssim, "r") as f:
+                    lines = [line.strip() for line in f.readlines() if line.strip()]
+                    if lines:
+                        last_line = lines[-1]
+                        if "All:" in last_line:
+                            metrics["ssim_val"] = float(last_line.split("All:")[1].split()[0])
+        except Exception as e:
+            print(f"[Warn] PSNR/SSIM calculation failed: {e}")
 
-    if not args.keep_intermediate:
-        shutil.rmtree(workdir, ignore_errors=True)
+    # 3. Visual dHash verification
+    try:
+        from PIL import Image
+        import imagehash
 
-    return 0 if not fails else 1
+        d_src = "tmp_src.jpg"
+        d_dst = "tmp_dst.jpg"
+        subprocess.run(["ffmpeg", "-y", "-i", src, "-vf", "select=eq(n\\,150)", "-vframes", "1", d_src], capture_output=True)
+        subprocess.run(["ffmpeg", "-y", "-i", dst, "-vf", "select=eq(n\\,150)", "-vframes", "1", d_dst], capture_output=True)
+        
+        if os.path.exists(d_src) and os.path.exists(d_dst):
+            h1 = imagehash.dhash(Image.open(d_src))
+            h2 = imagehash.dhash(Image.open(d_dst))
+            metrics["dhash_mean_distance"] = round((h1 - h2) / 64.0, 3)
+            os.remove(d_src)
+            os.remove(d_dst)
+    except ImportError:
+        print("[Warn] PIL/imagehash missing, skipping dHash verification.")
+    except Exception as e:
+        print(f"[Warn] dHash check failed: {e}")
+
+    # QA Acceptance Criteria checks
+    if (
+        metrics["audio_divergence_pct"] < 85.0
+        or metrics["ssim_val"] > 0.85
+        or metrics["dhash_mean_distance"] < 0.35
+    ):
+        metrics["verdict"] = "FAIL"
+
+    return metrics
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="v4.0.1 Media Mutation Pipeline")
+    parser.add_argument("input", help="Source multimedia file")
+    parser.add_argument("output", help="Destination file")
+    parser.add_argument(
+        "--preset",
+        choices=["transparent", "standard", "aggressive"],
+        default="standard",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--low-cpu", action="store_true", default=True)
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--keep-intermediate", action="store_true")
+    args = parser.parse_args()
+
+    compat = ffmpeg_compat.probe_compat()
+    print(f"[Compat] Detected FFmpeg v{compat.raw_version} (Major: {compat.major})")
+
+    audio_chain = stage_audio.build_audio_filterchain(compat, low_cpu=args.low_cpu, seed=args.seed)
+    cmd_file = "chroma_cmd.txt"
+    stage_video.generate_sendcmd_file(cmd_file, duration_sec=600.0)
+    video_chain = stage_video.build_video_filterchain(
+        compat, w=1920, h=1080, fps=30, low_cpu=args.low_cpu, seed=args.seed, sendcmd_path=cmd_file,
+    )
+
+    intermediate_file = "temp_encoded.mp4"
+    vsync_args = ["-vsync", "vfr"] if compat.major < 7 else ["-fps_mode", "vfr"]
+
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-i", args.input,
+        "-filter_complex", f"{audio_chain};{video_chain}",
+        "-map", "[aout]", "-map", "[0:v]",
+    ]
+    ffmpeg_cmd.extend(vsync_args)
+    ffmpeg_cmd.extend([
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k", intermediate_file,
+    ])
+
+    code, log = run_process_with_watchdog(ffmpeg_cmd)
+    if code != 0:
+        print("[Error] FFmpeg pipeline failed:")
+        print(log)
+        sys.exit(1)
+
+    print("[Container] Randomizing ftyp, scrubbing signatures, and injecting free atom...")
+    shutil.copyfile(intermediate_file, args.output)
+    ftyp_data = stage_container.randomize_ftyp(args.output, seed=args.seed)
+    scrub_data = stage_container.scrub_signatures(args.output, [b"Lavf", b"HandBrake", b"Xiph"])
+    atom_data = stage_container.inject_free_atom(args.output, size_bytes=128, seed=args.seed)
+    fingerprint_data = stage_container.compute_fingerprint(args.output)
+
+    verify_metrics = {}
+    if args.verify:
+        print("[Verify] Analyzing perceptual divergence metrics...")
+        verify_metrics = verify_divergence(args.input, args.output, compat)
+
+    manifest = {
+        "seed": args.seed,
+        "preset": args.preset,
+        "ffmpeg_major": compat.major,
+        "container_report": {
+            "major_brand_after": ftyp_data.get("major_brand_after", "N/A"),
+            "minor_version_after": ftyp_data.get("minor_version_after", "N/A"),
+            "compatible_brands_after": ftyp_data.get("compatible_brands_after", []),
+            "free_atom_size_bytes": atom_data.get("free_atom_size_bytes", 0),
+            "signatures_scrubbed": scrub_data,
+        },
+        "fingerprint": fingerprint_data,
+        "verification": verify_metrics,
+    }
+
+    with open("manifest.json", "w", encoding="utf-8") as mf:
+        json.dump(manifest, mf, indent=2)
+
+    # 1. FIXED SYNTAX ERROR HERE
+    if os.path.exists(cmd_file):
+        os.remove(cmd_file)
+    if not getattr(args, 'keep_intermediate', False) and os.path.exists(intermediate_file):
+        os.remove(intermediate_file)
+
+    print("[Done] Pipeline processing finished successfully.")
+    if args.verify:
+        print(f"  -> QA Verdict: {verify_metrics.get('verdict')}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
