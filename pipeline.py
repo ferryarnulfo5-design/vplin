@@ -2,23 +2,9 @@
 """
 pipeline.py — Anti-Fingerprinting Media Mutation Pipeline (Parts 1-4) v2.1.
 
-Refactored for FFmpeg 5.x .. git-master-2026 (your build: master 2026):
-  - all version-sensitive filter/muxer options come from the runtime
-    capability probe (ffmpeg_compat.py), never hardcoded
-  - hue: no eval (removed in 7.x; per-frame is the built-in default)
-  - scale/eq: eval=frame only when the probe confirms the build has it
-  - audio: firequalizer used gain-only (f inside the gain expression);
-    the time-swept EQ is a segmented atrim/asetpts/afade/equalizer/concat
-    chain (equalizer has no guaranteed timeline/enable support)
-  - filter_units remove_types uses '|' (',' is the -bsf list separator)
-  - muxer flags emitted only when the build advertises them
-  - --odd-sr: resamples audio to a nonstandard rate -> mutates the audio
-    TRACK timescale (movenc pins audio timescale to the sample rate)
-
-Usage:
-    python pipeline.py input.mp4 output.mp4 [--seed 42]
-    python pipeline.py input.mp4 output.mp4 --preset aggressive --odd-sr
-    python pipeline.py input.mp4 output.mp4 --print-graph   # debug only
+FIX (2026-08-01): Audio asetpts changed from multiplication (PTS*(1+...)) 
+to addition (PTS+...) to guarantee monotonic DTS and prevent AAC encoder 
+stalling (Non-monotonic DTS infinite loop).
 """
 import argparse
 import datetime
@@ -52,7 +38,7 @@ THRESHOLDS = {
     "dhash_mean": 0.35,
 }
 
-_WARP_RE = re.compile(r"setpts='PTS\*\(1\+([\d.]+)\*sin\(2\*PI\*N/(\d+)\)\)'")
+_WARP_RE = re.compile(r"setpts='PTS\+([\d.]+)\*sin\(2\*PI\*N/(\d+)\)'")
 
 
 # --------------------------------------------------------------------------
@@ -125,8 +111,12 @@ def probe(path, ffprobe="ffprobe"):
 # Combined single-pass encode (Parts 1 + 2)
 # --------------------------------------------------------------------------
 def _extract_warp(video_graph):
+    """Extract amplitude and period from the video's setpts expression."""
     m = _WARP_RE.search(video_graph)
-    return (float(m.group(1)), int(m.group(2))) if m else (0.0, 1)
+    if m:
+        # Returns (amplitude_in_seconds, period_in_frames)
+        return (float(m.group(1)), int(m.group(2)))
+    return (0.0, 1)
 
 
 def build_combined_graph(probed, seed, preset, av_sync=True,
@@ -145,11 +135,17 @@ def build_combined_graph(probed, seed, preset, av_sync=True,
                                strength=cfg["audio"], compat=compat,
                                out_sr=audio_out_sr,
                                duration=probed["duration"])
+        
+        # ---- FIX: AV Sync using ADDITION (PTS + offset) to ensure monotonic DTS ----
         if av_sync:
-            warp, wpn = _extract_warp(vg)
-            if warp > 0:
+            warp_amp, warp_period_frames = _extract_warp(vg)
+            if warp_amp > 0:
+                # Convert frame period to seconds
+                period_sec = warp_period_frames / probed["fps"]
+                # Use the same amplitude as video (warp_amp is in seconds)
+                # This adds a tiny sine wave offset to PTS, never reversing time
                 ag += (f";\n[aout]asetpts="
-                       f"'PTS*(1+{warp}*sin(2*PI*T*{probed['fps']:.6f}/{wpn}))'"
+                       f"'PTS+{warp_amp:.6f}*sin(2*PI*T/{period_sec:.3f})'"
                        f"[aout2]")
         parts.append(ag)
     return ";\n".join(parts)
