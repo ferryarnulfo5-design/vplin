@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-v4.0.1 Production-Grade Media Mutation Pipeline (Fixed for 2026+)
+v4.0.2 Production-Grade Media Mutation Pipeline (Fixed for Video-Only Streams)
 Orchestrates FFmpeg capabilities detection, audio/video deformation filter chains,
 container obfuscation, and perceptual divergence verification.
 """
@@ -54,6 +54,20 @@ def run_process_with_watchdog(
     return proc.returncode, "".join(output_log)
 
 
+def check_audio_presence(filepath: str) -> bool:
+    """Probes the media file to determine if an audio stream exists."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=codec_type", "-of",
+            "default=noprint_wrappers=1:nokey=1", filepath
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return "audio" in result.stdout.lower()
+    except Exception:
+        return False
+
+
 def verify_divergence(src: str, dst: str, compat: ffmpeg_compat.Capabilities) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {
         "audio_divergence_pct": 0.0,
@@ -63,20 +77,24 @@ def verify_divergence(src: str, dst: str, compat: ffmpeg_compat.Capabilities) ->
         "ssim_val": 1.0,
         "verdict": "PASS",
     }
+    
+    has_audio = check_audio_presence(src)
 
-    # 1. Chromaprint fpcalc audio divergence
-    try:
-        p1 = subprocess.run(["fpcalc", "-raw", src], capture_output=True, text=True)
-        p2 = subprocess.run(["fpcalc", "-raw", dst], capture_output=True, text=True)
-        if p1.returncode == 0 and p2.returncode == 0:
-            fp1 = p1.stdout.split("FINGERPRINT=")[1].strip()
-            fp2 = p2.stdout.split("FINGERPRINT=")[1].strip()
-            matches = sum(1 for a, b in zip(fp1, fp2) if a == b)
-            metrics["audio_divergence_pct"] = round(
-                (1.0 - (matches / max(len(fp1), len(fp2)))) * 100.0, 2
-            )
-    except Exception as e:
-        print(f"[Warn] Chromaprint verification failed: {e}")
+    # 1. Chromaprint fpcalc audio divergence (Only if audio exists)
+    if has_audio:
+        try:
+            p1 = subprocess.run(["fpcalc", "-raw", src], capture_output=True, text=True)
+            p2 = subprocess.run(["fpcalc", "-raw", dst], capture_output=True, text=True)
+            if p1.returncode == 0 and p2.returncode == 0:
+                fp1 = p1.stdout.split("FINGERPRINT=")[1].strip()
+                fp2 = p2.stdout.split("FINGERPRINT=")[1].strip()
+                if fp1 and fp2:
+                    matches = sum(1 for a, b in zip(fp1, fp2) if a == b)
+                    metrics["audio_divergence_pct"] = round(
+                        (1.0 - (matches / max(len(fp1), len(fp2)))) * 100.0, 2
+                    )
+        except Exception as e:
+            print(f"[Warn] Chromaprint verification failed: {e}")
 
     # 2. PSNR & SSIM verification with sampling (1 frame per 300)
     if compat.has("psnr") and compat.has("ssim"):
@@ -138,19 +156,17 @@ def verify_divergence(src: str, dst: str, compat: ffmpeg_compat.Capabilities) ->
     except Exception as e:
         print(f"[Warn] dHash check failed: {e}")
 
-    # QA Acceptance Criteria checks
-    if (
-        metrics["audio_divergence_pct"] < 85.0
-        or metrics["ssim_val"] > 0.85
-        or metrics["dhash_mean_distance"] < 0.35
-    ):
+    # QA Acceptance Criteria checks (Dynamic)
+    if has_audio and metrics["audio_divergence_pct"] < 85.0:
+        metrics["verdict"] = "FAIL"
+    elif metrics["ssim_val"] > 0.85 or metrics["dhash_mean_distance"] < 0.35:
         metrics["verdict"] = "FAIL"
 
     return metrics
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="v4.0.1 Media Mutation Pipeline")
+    parser = argparse.ArgumentParser(description="v4.0.2 Media Mutation Pipeline")
     parser.add_argument("input", help="Source multimedia file")
     parser.add_argument("output", help="Destination file")
     parser.add_argument(
@@ -167,26 +183,37 @@ def main() -> None:
     compat = ffmpeg_compat.probe_compat()
     print(f"[Compat] Detected FFmpeg v{compat.raw_version} (Major: {compat.major})")
 
-    audio_chain = stage_audio.build_audio_filterchain(compat, low_cpu=args.low_cpu, seed=args.seed)
+    # 1. Check for audio stream presence
+    has_audio = check_audio_presence(args.input)
+
+    # 2. Build filter chains dynamically based on stream presence
     cmd_file = "chroma_cmd.txt"
     stage_video.generate_sendcmd_file(cmd_file, duration_sec=600.0)
     video_chain = stage_video.build_video_filterchain(
         compat, w=1920, h=1080, fps=30, low_cpu=args.low_cpu, seed=args.seed, sendcmd_path=cmd_file,
     )
 
+    if has_audio:
+        print("[Info] Audio stream detected. Applying full A/V mutation.")
+        audio_chain = stage_audio.build_audio_filterchain(compat, low_cpu=args.low_cpu, seed=args.seed)
+        filter_complex = f"{audio_chain};[0:v]{video_chain}[vout]"
+        map_args = ["-map", "[aout]", "-map", "[vout]"]
+        audio_enc = ["-c:a", "aac", "-b:a", "128k"]
+    else:
+        print("[Info] No audio stream detected. Applying Video-only mutation.")
+        filter_complex = f"[0:v]{video_chain}[vout]"
+        map_args = ["-map", "[vout]"]
+        audio_enc = []
+
     intermediate_file = "temp_encoded.mp4"
     vsync_args = ["-vsync", "vfr"] if compat.major < 7 else ["-fps_mode", "vfr"]
 
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-i", args.input,
-        "-filter_complex", f"{audio_chain};{video_chain}",
-        "-map", "[aout]", "-map", "[0:v]",
-    ]
-    ffmpeg_cmd.extend(vsync_args)
-    ffmpeg_cmd.extend([
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k", intermediate_file,
-    ])
+        "-filter_complex", filter_complex,
+    ] + map_args + vsync_args + [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23"
+    ] + audio_enc + [intermediate_file]
 
     code, log = run_process_with_watchdog(ffmpeg_cmd)
     if code != 0:
@@ -224,7 +251,6 @@ def main() -> None:
     with open("manifest.json", "w", encoding="utf-8") as mf:
         json.dump(manifest, mf, indent=2)
 
-    # 1. FIXED SYNTAX ERROR HERE
     if os.path.exists(cmd_file):
         os.remove(cmd_file)
     if not getattr(args, 'keep_intermediate', False) and os.path.exists(intermediate_file):
