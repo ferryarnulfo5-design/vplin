@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-stage_container.py -- Deep container & stream obfuscation (hex-level surgery).
-Ultra-robust: handles corrupted ftyp brands, missing boxes, and binary data.
+stage_container.py -- Deep container & stream obfuscation (FINAL FIX).
+Robust: handles all MP4 brands, no decode errors, creates ftyp if missing.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import hashlib
 from typing import Dict, List, Optional, Tuple
 
 # ----------------------------------------------------------------------
-# Forensic signatures to scrub (byte strings)
+# Forensic signatures
 # ----------------------------------------------------------------------
 SIGNATURES: List[bytes] = [
     b'Lavf', b'Lavc', b'FFmpeg', b'ffmpeg',
@@ -22,7 +22,6 @@ SIGNATURES: List[bytes] = [
     b'Libav', b'avcodec', b'avformat', b'L-SMASH',
 ]
 
-# ftyp device profiles: (major_brand, minor_version, compatible_brands)
 DEVICE_PROFILES: List[Tuple[str, int, List[str]]] = [
     ('qt  ', 512, ['qt  ', 'isom']),
     ('qt  ', 538, ['qt  ', 'isom', 'iso2']),
@@ -34,7 +33,7 @@ DEVICE_PROFILES: List[Tuple[str, int, List[str]]] = [
 _BRAND_POOL = ['isom', 'mp42', 'avc1', 'iso2', 'iso5', 'mp41', 'qt  ', 'dash']
 
 # ----------------------------------------------------------------------
-# 1) Forensic signature scan & scrub
+# 1) Signature scan (no mmap.count)
 # ----------------------------------------------------------------------
 def scan_signatures(path: str) -> Dict[str, int]:
     found: Dict[str, int] = {}
@@ -59,19 +58,17 @@ def scrub_signatures(path: str) -> int:
     return replaced
 
 # ----------------------------------------------------------------------
-# 2) ftyp randomization (robust: no Unicode decode errors)
+# 2) ftyp randomization (FIXED: uses latin1 decoding)
 # ----------------------------------------------------------------------
 def randomize_ftyp(path: str, seed: Optional[int] = None,
                    profile_idx: Optional[int] = None) -> Dict:
-    """Rewrite ftyp to mimic a hardware recorder. Handles binary brand bytes."""
     rng = random.Random(seed)
-    
     with open(path, "r+b") as fh:
         data = bytearray(fh.read())
         ftyp_offset = data.find(b"ftyp")
         
         if ftyp_offset == -1:
-            # No ftyp, create one
+            # Create new ftyp
             if profile_idx is None:
                 profile_idx = rng.randrange(len(DEVICE_PROFILES))
             major, minor, brands = DEVICE_PROFILES[profile_idx]
@@ -84,13 +81,13 @@ def randomize_ftyp(path: str, seed: Optional[int] = None,
             fh.write(ftyp_box + bytes(data))
             fh.flush()
             return {
-                "major_brand_after": major.decode('latin1'),
+                "major_brand_after": major.decode("latin1"),
                 "minor_version_after": minor,
-                "compatible_brands_after": [b.decode('latin1') for b in brands_bytes[:4]],
-                "note": "ftyp missing, created new one"
+                "compatible_brands_after": [b.decode("latin1") for b in brands_bytes[:4]],
+                "note": "ftyp created"
             }
         
-        # Parse ftyp size
+        # Parse existing ftyp
         size = struct.unpack(">I", data[ftyp_offset:ftyp_offset+4])[0]
         if size == 1:
             size = struct.unpack(">Q", data[ftyp_offset+8:ftyp_offset+16])[0]
@@ -100,46 +97,35 @@ def randomize_ftyp(path: str, seed: Optional[int] = None,
         
         major_before = data[ftyp_offset+4:ftyp_offset+8]
         minor_before = struct.unpack(">I", data[ftyp_offset+8:ftyp_offset+12])[0]
-        brands_before = []
-        pos = ftyp_offset + 12
-        while pos < ftyp_offset + size:
-            if pos + 4 <= len(data):
-                brands_before.append(bytes(data[pos:pos+4]))
-                pos += 4
-            else:
-                break
         
-        n = max(1, len(brands_before))
+        brands_before: List[bytes] = []
+        pos = ftyp_offset + 12
+        while pos < ftyp_offset + size and pos + 4 <= len(data):
+            brands_before.append(data[pos:pos+4])
+            pos += 4
+        
+        n = max(4, len(brands_before))
         
         if profile_idx is None:
             profile_idx = rng.randrange(len(DEVICE_PROFILES))
         major_new, minor_new, profile_brands = DEVICE_PROFILES[profile_idx]
         major_new = major_new.encode('ascii')
         
-        # Build new brands - use bytes everywhere, no decode
-        brands_new: List[bytes] = []
-        # Start with profile brands
-        pool = [b.encode('ascii') for b in profile_brands]
-        # Add existing brands (as bytes)
-        for b in brands_before:
-            if b not in pool:
-                pool.append(b)
-        # Add fallback pool
-        for b in _BRAND_POOL:
-            bbytes = b.encode('ascii')
-            if bbytes not in pool:
-                pool.append(bbytes)
+        # Build new brands - using latin1 to avoid decode errors
+        pool = list(dict.fromkeys(profile_brands + 
+                   [b.decode("latin1", errors="replace") for b in brands_before] + 
+                   _BRAND_POOL))
+        pool_bytes = [b.encode('ascii', errors="replace") for b in pool]
         
-        # Randomly pick n brands from pool
+        brands_new: List[bytes] = []
         for _ in range(n):
-            if pool:
-                chosen = pool.pop(rng.randrange(len(pool)))
+            if pool_bytes:
+                chosen = pool_bytes.pop(rng.randrange(len(pool_bytes)))
                 brands_new.append(chosen)
             else:
                 brands_new.append(b"isom")
         rng.shuffle(brands_new)
         
-        # Create new ftyp box
         new_ftyp = b"ftyp" + major_new + struct.pack(">I", minor_new) + b"".join(brands_new)
         while len(new_ftyp) < size:
             new_ftyp += b" "
@@ -149,22 +135,21 @@ def randomize_ftyp(path: str, seed: Optional[int] = None,
         fh.seek(ftyp_offset)
         fh.write(new_ftyp)
         fh.flush()
-        
+    
     return {
-        "major_brand_before": major_before.decode('latin1', errors='replace'),
-        "major_brand_after": major_new.decode('latin1'),
+        "major_brand_before": major_before.decode("latin1", errors="replace"),
+        "major_brand_after": major_new.decode("latin1"),
         "minor_version_before": minor_before,
         "minor_version_after": minor_new,
-        "compatible_brands_before": [b.decode('latin1', errors='replace') for b in brands_before[:6]],
-        "compatible_brands_after": [b.decode('latin1', errors='replace') for b in brands_new[:6]],
+        "compatible_brands_before": [b.decode("latin1", errors="replace") for b in brands_before[:6]],
+        "compatible_brands_after": [b.decode("latin1") for b in brands_new[:6]],
         "profile": DEVICE_PROFILES[profile_idx][0].strip(),
     }
 
 # ----------------------------------------------------------------------
-# 3) free-atom injection (simplified, robust)
+# 3) free-atom injection (simplified, no nested box walking)
 # ----------------------------------------------------------------------
 def inject_free_atom(path: str, seed: Optional[int] = None, max_padding: int = 128) -> Dict:
-    """Insert a random free box after ftyp; patch stco/co64 offsets."""
     rng = random.Random(seed)
     padding = rng.randint(8, max_padding)
     free_box = struct.pack(">I", 8 + padding) + b"free" + bytes(rng.randrange(256) for _ in range(padding))
@@ -173,30 +158,32 @@ def inject_free_atom(path: str, seed: Optional[int] = None, max_padding: int = 1
     with open(path, "r+b") as fh:
         data = bytearray(fh.read())
         ftyp_offset = data.find(b"ftyp")
+        
         if ftyp_offset == -1:
-            # No ftyp, just prepend
-            ftyp_box = b"ftyp" + b"isom" + struct.pack(">I", 0) + b"isom" + b"mp42" + b"avc1"
+            # No ftyp, prepend one
+            ftyp_box = b"ftyp" + b"isom" + struct.pack(">I", 0) + b"isom" + b"mp42"
             fh.seek(0)
             fh.write(ftyp_box + free_box + bytes(data))
             fh.flush()
             return {"free_atom_size_bytes": delta, "padding_bytes": padding, "note": "ftyp created"}
         
+        # Read ftyp size
         size = struct.unpack(">I", data[ftyp_offset:ftyp_offset+4])[0]
         if size == 1:
             size = struct.unpack(">Q", data[ftyp_offset+8:ftyp_offset+16])[0]
-        
         ftyp_data = data[ftyp_offset:ftyp_offset+size]
         rest = data[ftyp_offset+size:]
+        
         fh.seek(ftyp_offset)
         fh.write(ftyp_data)
         fh.write(free_box)
         fh.write(rest)
         fh.flush()
     
-    # Patch stco/co64 offsets
+    # Patch stco/co64 offsets (simple byte search)
     with open(path, "r+b") as fh:
         data = bytearray(fh.read())
-        # stco
+        # Patch stco
         pos = data.find(b"stco")
         while pos != -1:
             if pos + 12 <= len(data):
@@ -209,7 +196,7 @@ def inject_free_atom(path: str, seed: Optional[int] = None, max_padding: int = 1
                         p += 4
             pos = data.find(b"stco", pos + 1)
         
-        # co64
+        # Patch co64
         pos = data.find(b"co64")
         while pos != -1:
             if pos + 12 <= len(data):
@@ -226,11 +213,19 @@ def inject_free_atom(path: str, seed: Optional[int] = None, max_padding: int = 1
         fh.write(data)
         fh.flush()
     
-    return {"free_atom_size_bytes": delta, "padding_bytes": padding}
+    mdat_size = None
+    with open(path, "rb") as fh:
+        data = fh.read()
+        mpos = data.find(b"mdat")
+        if mpos != -1 and mpos + 8 <= len(data):
+            mdat_size = struct.unpack(">I", data[mpos:mpos+4])[0]
+    
+    return {
+        "free_atom_size_bytes": delta,
+        "padding_bytes": padding,
+        "mdat_size_after_bytes": mdat_size,
+    }
 
-# ----------------------------------------------------------------------
-# 4) Verify
-# ----------------------------------------------------------------------
 def verify_no_signatures(path: str) -> Dict[str, int]:
     return scan_signatures(path)
 
@@ -243,9 +238,6 @@ def fingerprint(path: str) -> Tuple[str, str, int]:
             sha.update(chunk)
     return md5.hexdigest(), sha.hexdigest(), os.path.getsize(path)
 
-# ----------------------------------------------------------------------
-# Standalone test
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
     path = sys.argv[1]
