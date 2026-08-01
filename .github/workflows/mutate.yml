@@ -1,0 +1,63 @@
+name: media-mutation-pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_path:
+        description: 'Source video: repo path (e.g. sample/input.mp4) or public https URL'
+        required: true
+        default: 'sample/input.mp4'
+      verify:
+        description: 'Run PSNR/SSIM + forensic verification'
+        type: boolean
+        default: true
+      baseline:
+        description: 'Encode clean baseline to measure true PSNR drop (adds ~5-8 min)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mutate:
+    runs-on: ubuntu-latest            # 2-core / ~7 GB / 120-min limit
+    timeout-minutes: 110              # safety margin under the 120-min cap
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure ffmpeg
+        run: |
+          command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          ffmpeg -version | head -1
+
+      - name: Resolve input
+        run: |
+          INPUT="${{ github.event.inputs.input_path }}"
+          if [[ "$INPUT" =~ ^https?:// ]]; then
+            curl -fL --retry 3 -o input.mp4 "$INPUT"
+          else
+            cp "$INPUT" input.mp4
+          fi
+          ls -lh input.mp4
+          ffprobe -v error -show_entries format=duration -of default=nw=1 input.mp4
+
+      - name: Run mutation pipeline
+        run: |
+          ARGS="input.mp4 out --verify --seed ${{ github.run_id }}"
+          if [[ "${{ github.event.inputs.baseline }}" == "true" ]]; then
+            ARGS="$ARGS --baseline"
+          fi
+          python3 pipeline.py $ARGS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutated-video
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
