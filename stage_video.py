@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
 """
 stage_video.py — Part 2: video lattice deformation graph builder.
-
-v2 changes (git-master 2026 removed eval from scale AND eq, not just hue):
-  - scale: dynamic w/h expressions ONLY when the build exposes eval=frame;
-    otherwise a seeded STATIC zoom (deterministic either way).
-  - eq:    dynamic gamma/contrast/saturation ONLY with eval=frame;
-    otherwise seeded static values.
-  - crop:  dynamic x/y always (crop's default eval mode is per-frame);
-    the eval option is appended only when present.
-  - hue:   dynamic always — per-frame evaluation is the built-in default.
-    NEVER pass eval to hue (removed in 7.x).
 """
 from __future__ import annotations
 import random
-
 
 def build_video_graph(width, height, fps=30.0, seed=None, strength=1.0,
                       interpolate=False, ghost=True, grain=True, compat=None):
@@ -22,7 +11,6 @@ def build_video_graph(width, height, fps=30.0, seed=None, strength=1.0,
     W = int(width) - int(width) % 2
     H = int(height) - int(height) % 2
 
-    # ---- scale: dynamic only if eval=frame exists --------------------------
     zoom = rng.uniform(-0.010, 0.010) * strength
     if compat is None or compat.scale_has_eval:
         pz = rng.randint(60, 140)
@@ -32,7 +20,6 @@ def build_video_graph(width, height, fps=30.0, seed=None, strength=1.0,
         w = int(W * (1 + zoom) / 2) * 2
         scale = f"scale={w}:-2"
 
-    # ---- crop: per-frame expressions (default eval mode) -------------------
     cw, ch = rng.uniform(0.94, 0.99), rng.uniform(0.94, 0.99)
     px, py = rng.randint(50, 120), rng.randint(50, 120)
     panx = rng.uniform(4, 14) * strength
@@ -43,7 +30,6 @@ def build_video_graph(width, height, fps=30.0, seed=None, strength=1.0,
     if compat is not None and compat.crop_has_eval:
         crop += ":eval=frame"
 
-    # ---- eq: dynamic only with eval=frame ----------------------------------
     c0 = 1.0 + rng.uniform(-0.04, 0.04) * strength
     g0 = 0.97 + rng.uniform(-0.03, 0.03) * strength
     s0 = 1.0 + rng.uniform(-0.05, 0.05) * strength
@@ -58,20 +44,17 @@ def build_video_graph(width, height, fps=30.0, seed=None, strength=1.0,
     else:
         eq = f"eq=contrast={c0:.4f}:gamma={g0:.4f}:saturation={s0:.4f}"
 
-    # ---- hue: per-frame default; NEVER pass eval ---------------------------
     h0, h1 = rng.uniform(-1.5, 1.5), rng.uniform(2.0, 7.0) * strength
     hs0, hs1 = 1.0, rng.uniform(0.04, 0.12) * strength
     ph, phs = rng.randint(60, 180), rng.randint(60, 180)
     hue = (f"hue=h='{h0:.4f}+{h1:.4f}*sin(2*PI*n/{ph})':"
            f"s='{hs0:.4f}+{hs1:.4f}*sin(2*PI*n/{phs})'")
 
-    # ---- timewarp: keep EXACT format for pipeline _WARP_RE mirror ----------
     warp = rng.uniform(0.001, 0.006) * strength
     wpn = rng.randint(150, 300)
     max_shift_v = warp * 0.5
     setpts = f"setpts='PTS+{max_shift_v:.6f}*sin(2*PI*N/{wpn})'"
 
-    # ---- assemble -----------------------------------------------------------
     g = []
     g.append(f"[0:v]fps={fps:.6f}[vcfr]")
     cur = "vcfr"
