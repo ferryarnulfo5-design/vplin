@@ -1,98 +1,125 @@
 #!/usr/bin/env python3
 """
-ffmpeg_compat.py – Runtime capability probe for FFmpeg.
-Exports: probe_compat (for pipeline), and helper classes.
+v4.0 FFmpeg Compatibility & Capability Profiler
+Detects available filters, dynamic options, and API version flags to ensure
+graceful fallback chains across FFmpeg 4.x - 7.x+.
 """
-from __future__ import annotations
 
 import re
 import subprocess
-from dataclasses import dataclass, field
-from typing import Dict, Set, Tuple, Optional
+from typing import Dict, List, Tuple
 
-@dataclass
+
 class Capabilities:
-    ffmpeg: str = "ffmpeg"
-    ffprobe: str = "ffprobe"
-    version: Tuple[int, int, int] = (0, 0, 0)
-    version_str: str = "unknown"
-    filters: Dict[str, bool] = field(default_factory=dict)
-    filter_opts: Dict[str, Set[str]] = field(default_factory=dict)
-    # derived
-    scale_eval: bool = False
-    crop_eval: bool = False
-    tmix_weights: bool = False
-    amix_normalize: bool = False
-    firequalizer_tv: bool = False
+    def __init__(self, raw_version: str, filters: List[str], options: Dict[str, List[str]]):
+        self.raw_version = raw_version
+        self.version_tuple = self._parse_version(raw_version)
+        self.major = self.version_tuple[0]
+        self._filters = set(filters)
+        self._options = options
 
-    def has(self, name: str) -> bool:
-        return self.filters.get(name, False)
+        # Derived dynamic compatibility flags
+        self.scale_eval = self.opt("scale", "eval")
+        self.crop_eval = self.opt("crop", "eval")
+        self.tmix_weights = self.opt("tmix", "weights")
+        self.amix_normalize = self.opt("amix", "normalize")
+        self.firequalizer_tv = self.opt("firequalizer", "gain")
+        self.has_chromashift = self.has("chromashift")
+        self.has_rgbashift = self.has("rgbashift")
+        self.has_zoompan = self.has("zoompan")
 
-    def opt(self, fname: str, option: str) -> bool:
-        return option in self.filter_opts.get(fname, set())
+    @staticmethod
+    def _parse_version(version_str: str) -> Tuple[int, int, int]:
+        match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", version_str)
+        if match:
+            major = int(match.group(1))
+            minor = int(match.group(2))
+            patch = int(match.group(3)) if match.group(3) else 0
+            return (major, minor, patch)
+        # Default fallback if build string is non-standard
+        return (4, 4, 0)
 
-    def summary(self) -> str:
-        return (
-            f"ffmpeg {self.version_str} ({self.ffmpeg})\n"
-            f"  firequalizer={self.has('firequalizer')} "
-            f"rgbashift={self.has('rgbashift')} tmix={self.has('tmix')} "
-            f"aphaser={self.has('aphaser')} zoompan={self.has('zoompan')}\n"
-            f"  scale_eval={self.scale_eval} crop_eval={self.crop_eval} "
-            f"tmix_weights={self.tmix_weights} amix_normalize={self.amix_normalize} "
-            f"firequalizer_tv={self.firequalizer_tv}"
-        )
+    def has(self, filter_name: str) -> bool:
+        return filter_name in self._filters
 
-def _run(cmd, timeout=30):
+    def opt(self, filter_name: str, option_name: str) -> bool:
+        if filter_name not in self._options:
+            return False
+        return option_name in self._options[filter_name]
+
+
+def _run_cmd(cmd: List[str]) -> str:
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout + p.stderr
-    except Exception as e:
-        return -1, str(e)
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        return proc.stdout + proc.stderr
+    except Exception:
+        return ""
 
-def probe_compat(ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe") -> Capabilities:
-    caps = Capabilities(ffmpeg=ffmpeg, ffprobe=ffprobe)
-    # version
-    rc, out = _run([ffmpeg, "-hide_banner", "-version"])
-    if rc != 0:
-        raise RuntimeError(f"ffmpeg not runnable: {out[:200]}")
-    m = re.search(r"ffmpeg version (\d+)\.(\d+)\.(\d+)", out)
-    if m:
-        caps.version = tuple(map(int, m.groups()))
-        caps.version_str = ".".join(map(str, caps.version))
-    else:
-        caps.version_str = out.splitlines()[0][:80]
 
-    # filters list
-    rc, out = _run([ffmpeg, "-hide_banner", "-filters"])
-    for line in out.splitlines():
-        if " V->V " in line or " A->A " in line:
-            parts = line.split()
-            if len(parts) >= 2 and re.match(r'^[a-zA-Z0-9_]+$', parts[1]):
-                caps.filters[parts[1]] = True
+def probe_compat(ffmpeg_bin: str = "ffmpeg") -> Capabilities:
+    # 1. Version checking
+    version_out = _run_cmd([ffmpeg_bin, "-version"])
+    v_match = re.search(r"ffmpeg version (\S+)", version_out)
+    raw_v = v_match.group(1) if v_match else "4.4.0"
 
-    # per-filter options
-    for fname in ("scale", "crop", "tmix", "amix", "firequalizer", "rgbashift",
-                  "chromashift", "zoompan", "aphaser", "compand", "chorus", "eq",
-                  "noise", "tblend", "framerate", "psnr", "ssim", "aequalizer",
-                  "equalizer", "alimiter", "asetrate", "atempo", "aresample",
-                  "highpass", "lowpass", "bandpass", "atrim", "asplit", "volume",
-                  "apad", "select", "setpts", "format", "fps", "sendcmd"):
-        caps.filters.setdefault(fname, False)
-        rc, out = _run([ffmpeg, "-hide_banner", "-h", f"filter={fname}"])
-        opts = set()
-        for line in out.splitlines():
-            m = re.match(r'^\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+<', line)
-            if m:
-                opts.add(m.group(1))
-        caps.filter_opts[fname] = opts
-        if rc == 0 and out:
-            caps.filters[fname] = True  # filter exists if help succeeded
+    # 2. Filter enumeration
+    filters_out = _run_cmd([ffmpeg_bin, "-filters"])
+    available_filters = []
+    for line in filters_out.splitlines():
+        match = re.match(r"^\s*[T.][S.][C.]\s+(\w+)", line)
+        if match:
+            available_filters.append(match.group(1))
 
-    # derived
-    caps.scale_eval = caps.opt("scale", "eval")
-    caps.crop_eval = caps.opt("crop", "eval")
-    caps.tmix_weights = caps.opt("tmix", "weights")
-    caps.amix_normalize = caps.opt("amix", "normalize")
-    caps.firequalizer_tv = caps.has("firequalizer") and ("pts" in str(out) or True)  # approximate
+    # 3. Targeted filter option queries for critical transforms
+    target_filters = [
+        "scale",
+        "crop",
+        "tmix",
+        "amix",
+        "firequalizer",
+        "equalizer",
+        "rgbashift",
+        "chromashift",
+        "zoompan",
+        "aphaser",
+        "chorus",
+        "compand",
+        "noise",
+        "tblend",
+        "framerate",
+        "psnr",
+        "ssim",
+        "alimiter",
+        "asetrate",
+        "atempo",
+        "aresample",
+        "highpass",
+        "lowpass",
+        "bandpass",
+        "atrim",
+        "asplit",
+        "volume",
+        "setpts",
+        "format",
+        "fps",
+        "sendcmd",
+        "concat",
+        "aecho",
+    ]
 
-    return caps
+    options_map = {}
+    for f in target_filters:
+        if f in available_filters:
+            h_out = _run_cmd([ffmpeg_bin, "-h", f"filter={f}"])
+            opts = re.findall(r"^\s+([a-zA-Z0-9_]+)\s+<", h_out, re.MULTILINE)
+            options_map[f] = list(set(opts))
+
+    return Capabilities(raw_v, available_filters, options_map)
