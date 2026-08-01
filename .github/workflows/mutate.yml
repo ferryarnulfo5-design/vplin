@@ -6,7 +6,8 @@ on:
       media_url:
         description: 'Direct download URL for input MP4'
         required: true
-        default: 'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_1MB.mp4'
+        default: 'https://github.com/ferryarnulfo5-design/vplin/releases/download/v1.0/input.mp4'
+        type: string
       preset:
         description: 'Mutation Aggressiveness Level'
         required: true
@@ -47,7 +48,7 @@ jobs:
 
       - name: Fetch Input Video Asset
         run: |
-          curl -L "${{ github.event.inputs.media_url || 'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_1MB.mp4' }}" -o input.mp4
+          curl -L "${{ github.event.inputs.media_url || 'https://github.com/ferryarnulfo5-design/vplin/releases/download/v1.0/input.mp4' }}" -o input.mp4
 
       - name: Execute Cryptographic Mutation Pipeline
         run: |
