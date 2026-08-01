@@ -1,13 +1,6 @@
+#!/usr/bin/env python3
 """
 stage_container.py — Part 3 container obfuscation (refactored for master).
-
-Fixes applied:
-  - filter_units remove_types uses '|' as the type-set separator (',' is the
-    -bsf filter separator — 6,12 silently became a bogus second filter).
-  - Muxer options (video_track_timescale, write_udta/btrt/prft/tmcd, brand)
-    are emitted ONLY when the running build's muxer exposes them.
-  - audio_track_timescale does not exist in FFmpeg: audio track timescale is
-    pinned to the codec sample rate. Use the pipeline's --odd-sr instead.
 """
 import argparse
 import datetime
@@ -46,7 +39,6 @@ PROFILES = {
                   "audio_first": True},
 }
 
-
 def _run(cmd):
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -61,12 +53,10 @@ def _run(cmd):
             print(s)
     return proc.wait(), "\n".join(lines)
 
-
 def _is_option_error(log: str) -> bool:
     return any(k in log for k in ("Option not found", "Unrecognized option",
                                   "Unable to find a suitable output format",
                                   "Unknown option", "not found"))
-
 
 def build_container_args(src: str, dst: str, seed: int | None = None,
                          profile: str | None = None, codec: str = "h264",
@@ -94,8 +84,6 @@ def build_container_args(src: str, dst: str, seed: int | None = None,
     if compat.mov_opt("brand"):
         req += ["-brand", p["brand"]]
 
-    # '|' is the unit-type-set separator inside filter_units (',' is the
-    # -bsf filter-list separator and must NOT be used here)
     if strip_sei and compat.has_filter_units:
         nals = "39|40" if codec == "hevc" else "6|12"
         req += ["-bsf:v", f"filter_units=remove_types={nals}"]
@@ -103,7 +91,6 @@ def build_container_args(src: str, dst: str, seed: int | None = None,
     req += ["-avoid_negative_ts", "make_zero",
             "-fflags", "+bitexact"]
 
-    # ---- capability-gated optional muxer flags -----------------------------
     opt_group = []
     if compat.mov_opt("video_track_timescale"):
         opt_group += ["-video_track_timescale", str(ts)]
@@ -124,7 +111,6 @@ def build_container_args(src: str, dst: str, seed: int | None = None,
             "frag_ms": frag_ms, "strip_sei": strip_sei}
     return req, opt_group, meta
 
-
 def run_container_stage(src: str, dst: str, seed: int | None = None,
                         profile: str | None = None, codec: str = "h264",
                         strip_sei: bool = True, fake_creation: bool = True,
@@ -133,7 +119,7 @@ def run_container_stage(src: str, dst: str, seed: int | None = None,
     compat = compat or Compat(ffmpeg=ffmpeg)
     req, opt_group, meta = build_container_args(
         src, dst, seed, profile, codec, strip_sei, fake_creation, compat)
-    variants = [req + opt_group, req]     # full -> drop gated group
+    variants = [req + opt_group, req]
     last_rc, last_log = -1, ""
     for v in variants:
         rc, log = _run([ffmpeg] + v)
@@ -145,7 +131,6 @@ def run_container_stage(src: str, dst: str, seed: int | None = None,
         if not _is_option_error(log):
             break
     raise RuntimeError(f"container stage failed (rc={last_rc}):\n{last_log[-2000:]}")
-
 
 def scrub_signatures(path: str, signatures=None) -> int:
     signatures = signatures or SIGNATURES
@@ -168,7 +153,6 @@ def scrub_signatures(path: str, signatures=None) -> int:
             f.write(data)
         os.replace(tmp, path)
     return hits
-
 
 def forensic_report(path: str, ffprobe: str = "ffprobe") -> dict:
     with open(path, "rb") as f:
@@ -201,22 +185,3 @@ def forensic_report(path: str, ffprobe: str = "ffprobe") -> dict:
     print(f"format tags      : {fmt.get('tags', {})}")
     print(f"stream tags      : {[s.get('tags', {}) for s in streams]}")
     return report
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Part 3: container obfuscation")
-    ap.add_argument("src"); ap.add_argument("dst")
-    ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--profile", choices=list(PROFILES), default=None)
-    ap.add_argument("--codec", default="h264", choices=["h264", "hevc"])
-    ap.add_argument("--no-sei", action="store_true")
-    ap.add_argument("--no-scrub", action="store_true")
-    ap.add_argument("--check", action="store_true")
-    a = ap.parse_args()
-    meta = run_container_stage(
-        a.src, a.dst, seed=a.seed, profile=a.profile, codec=a.codec,
-        strip_sei=not a.no_sei, scrub=not a.no_scrub)
-    print(f"profile={meta['profile']} timescale={meta['timescale']} "
-          f"frag_ms={meta['frag_ms']} scrubbed={meta['scrubbed']}")
-    if a.check:
-        forensic_report(a.dst)
