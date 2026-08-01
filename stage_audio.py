@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-v4.0 Audio Disruption Module
-Implements dynamic equalization, split-band pitch skewing, phase warping,
-and non-linear amplitude compression to break audio fingerprinting (Chromaprint).
+v4.0.2 Audio Disruption Module
+Implements dynamic equalization (frequency-domain evaluation), split-band pitch skewing,
+phase warping, and non-linear amplitude compression to break audio fingerprinting (Chromaprint).
 """
 
 import random
@@ -11,10 +11,11 @@ from ffmpeg_compat import Capabilities
 
 
 def get_equalizer_chain(compat: Capabilities) -> str:
-    """3-Tier Fallback Equalization Chain."""
+    """3-Tier Fallback Equalization Chain (Fixed for Frequency-Only Evaluation)."""
     if compat.has("firequalizer"):
-        # Safe minimal FIR equalization (avoiding OOM on 2-core runners)
-        return "firequalizer=gain='if(lt(mod(pts*tb,20),10),-6*sin(f/1200),-1.5)'"
+        # FIXED: Removed time variables (pts, mod) which fail in standard FFmpeg builds.
+        # Using purely frequency-dependent sine wave modulation (-6*sin(f/1200) - 1.5).
+        return "firequalizer=gain='-6*sin(f/1200) - 1.5'"
     elif compat.has("equalizer"):
         return "equalizer=f=250:width_type=h:width=50:g=-3,equalizer=f=4000:width_type=h:width=200:g=2"
     elif compat.has("aequalizer"):
