@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-pipeline.py — Anti-Fingerprinting Media Mutation Pipeline (Parts 1-4)
-SIMPLIFIED: container obfuscation disabled (only signature scrub kept).
+pipeline.py — Anti-Fingerprinting Media Mutation Pipeline (Parts 1-4) v3.0 FINAL.
+Fixed: ffmpeg_compat import, container obfuscation safe dict access.
 """
 import argparse
 import datetime
@@ -13,14 +13,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 try:
     from ffmpeg_compat import probe_compat
     from stage_audio import build_audio_filtergraph
     from stage_video import build_video_filtergraph
-    from stage_container import scrub_signatures, scan_signatures, fingerprint
+    import stage_container as sc
 except ImportError as e:
-    sys.exit(f"missing module: {e}")
+    sys.exit(f"missing module: {e}\nffmpeg_compat.py, stage_audio.py, "
+             "stage_video.py and stage_container.py must sit next to pipeline.py")
 
 PRESETS = {
     "transparent": {"audio": 0.5, "video": 0.5, "interpolate": False},
@@ -34,22 +36,24 @@ THRESHOLDS = {
     "dhash_mean": 0.35,
 }
 
-_WARP_RE = re.compile(r"setpts='PTS\+([\d.]+)\*sin\(2\*PI\*N/(\d+)\)'")
-
 # --------------------------------------------------------------------------
 # Windows-safe subprocess runner
 # --------------------------------------------------------------------------
-def run(cmd, label="", quiet=False):
+def run(cmd, label="", quiet=False, timeout_sec=None):
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", creationflags=creationflags)
     time_re = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
     last = 0.0
+    t_start = time.monotonic()
+    lines = []
     for line in proc.stdout:
         s = line.strip()
+        lines.append(s)
         if not s or s.startswith(("frame=", "size=", "bitrate=",
-                                  "speed=", "progress=", "dup=", "drop=")):
+                                  "speed=", "progress=", "dup=", "drop=",
+                                  "fps=")):
             continue
         if "out_time_ms" in s or "N/A" in s:
             continue
@@ -63,16 +67,20 @@ def run(cmd, label="", quiet=False):
             continue
         if not quiet:
             print(f"  [{label}] {s}", flush=True)
+        if timeout_sec and (time.monotonic() - t_start) > timeout_sec:
+            proc.terminate()
+            proc.wait()
+            raise RuntimeError(f"timeout {timeout_sec}s exceeded")
     rc = proc.wait()
     if rc != 0 and not quiet:
         print(f"  [{label}] FAILED rc={rc}", flush=True)
-    return rc
+    return rc, "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
 # Source probe
 # --------------------------------------------------------------------------
-def probe(path, ffprobe="ffprobe"):
+def probe_media(path, ffprobe="ffprobe"):
     p = subprocess.run(
         [ffprobe, "-v", "error", "-show_streams", "-show_format",
          "-of", "json", path],
@@ -105,53 +113,47 @@ def probe(path, ffprobe="ffprobe"):
 # --------------------------------------------------------------------------
 # Combined single-pass encode (Parts 1 + 2)
 # --------------------------------------------------------------------------
-def _extract_warp(video_graph):
-    m = _WARP_RE.search(video_graph)
-    return (float(m.group(1)), int(m.group(2))) if m else (0.0, 1)
-
-def build_combined_graph(probed, seed, preset, av_sync=True,
-                         compat=None, audio_out_sr=None):
+def build_combined_graph(probed, seed, preset, compat=None, audio_out_sr=None):
     cfg = PRESETS[preset]
     parts = []
+    low_cpu = os.cpu_count() < 4
 
-    vg, _, _ = build_video_filtergraph(
-        compat, low_cpu=(os.cpu_count() < 4),
-        duration_s=probed["duration"],
-        fps=probed["fps"],
-        width=probed["width"],
-        height=probed["height"]
+    # Video
+    vgraph, _, vmeta = build_video_filtergraph(
+        compat, low_cpu, probed["duration"],
+        fps=probed["fps"], width=probed["width"], height=probed["height"]
     )
-    parts.append(vg)
+    parts.append(vgraph)
 
+    # Audio
     if probed["has_audio"]:
-        ag = build_audio_filtergraph(
-            compat, low_cpu=(os.cpu_count() < 4),
-            duration_s=probed["duration"],
-            sr=probed["sr"]
+        agraph = build_audio_filtergraph(
+            compat, low_cpu, probed["duration"],
+            sr=audio_out_sr or probed["sr"]
         )
-        # We skip AV sync completely (--no-av-sync always true)
-        parts.append(ag)
+        parts.append(agraph)
+
     return ";\n".join(parts)
 
 
-def encode_stage(src, inter, probed, seed, preset, ffmpeg, quiet, compat):
-    graph = build_combined_graph(probed, seed, preset, av_sync=False,
-                                 compat=compat, audio_out_sr=None)
+def encode_stage(src, inter, probed, seed, preset, ffmpeg, quiet, compat=None, audio_out_sr=None):
+    graph = build_combined_graph(probed, seed, preset, compat=compat, audio_out_sr=audio_out_sr)
     maps = ["-map", "[vout]"]
     if probed["has_audio"]:
         maps += ["-map", "[aout]"]
     cmd = ([ffmpeg, "-y", "-nostdin", "-hide_banner", "-i", src,
             "-filter_complex", graph] + maps +
            ["-c:v", "libx264", "-preset", "medium", "-crf", "23",
-            "-pix_fmt", "yuv420p"] + compat.fps_mode_args())
+            "-pix_fmt", "yuv420p"] + (["-vsync", "vfr"] if compat.major < 7 else ["-fps_mode", "vfr"]))
     if probed["has_audio"]:
         cmd += ["-c:a", "aac", "-b:a", "192k"]
     cmd += [inter]
-    return run(cmd, label="encode", quiet=quiet)
+    rc, log = run(cmd, label="encode", quiet=quiet, timeout_sec=7200)
+    return rc, log
 
 
 # --------------------------------------------------------------------------
-# Verification suite (kept)
+# Verification suite
 # --------------------------------------------------------------------------
 def audio_divergence(src, mut, fpcalc):
     def raw(p):
@@ -166,8 +168,8 @@ def audio_divergence(src, mut, fpcalc):
     if n == 0:
         return None
     diff = sum(x != y for x, y in zip(a[:n], b[:n]))
-    return {"divergence": round(diff / n, 4),
-            "src_frames": len(a), "out_frames": len(b)}
+    return {"divergence": round(diff / n, 4), "src_frames": len(a), "out_frames": len(b)}
+
 
 def video_crc_divergence(src, mut, ffmpeg):
     def crcs(p):
@@ -184,13 +186,14 @@ def video_crc_divergence(src, mut, ffmpeg):
     diff = sum(x != y for x, y in zip(a[:n], b[:n]))
     return {"divergence": round(diff / n, 4), "frames_compared": n}
 
+
 def dhash_divergence(src, mut, ffmpeg, compat=None, every=30, limit=40):
     try:
         import imagehash
         from PIL import Image
     except Exception:
         return None
-    fps_mode = compat.fps_mode_args() if compat else ["-fps_mode", "vfr"]
+    fps_mode = ["-fps_mode", "vfr"] if compat and compat.major >= 7 else ["-vsync", "vfr"]
 
     def frames(p):
         tmp = tempfile.mkdtemp()
@@ -216,15 +219,18 @@ def dhash_divergence(src, mut, ffmpeg, compat=None, every=30, limit=40):
             "beyond_0.35": round(sum(d > 0.35 for d in dists) / n, 4),
             "frames": n}
 
+
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Anti-fingerprinting media mutation pipeline")
     ap.add_argument("src")
     ap.add_argument("out")
     ap.add_argument("--preset", choices=list(PRESETS), default="standard")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--profile", choices=["iphone_mov", "android_mp4", "gopro_mp4"], default=None)
     ap.add_argument("--no-av-sync", action="store_true")
     ap.add_argument("--no-sei", action="store_true")
     ap.add_argument("--no-scrub", action="store_true")
@@ -236,60 +242,78 @@ def main():
     ap.add_argument("--ffmpeg", default="ffmpeg")
     ap.add_argument("--ffprobe", default="ffprobe")
     ap.add_argument("--fpcalc", default=None)
+    ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--baseline", action="store_true")
     args = ap.parse_args()
 
     if not os.path.isfile(args.src):
         sys.exit(f"source not found: {args.src}")
-    seed = args.seed if args.seed is not None else random.SystemRandom().randint(0, 2**31)
+
+    seed = args.seed if args.seed is not None else random.SystemRandom().randint(0, 2 ** 31)
     fpcalc = args.fpcalc or shutil.which("fpcalc")
 
+    # ---- runtime capability probe ----
     compat = probe_compat(args.ffmpeg)
-    print(f"== pipeline run  seed={seed}  preset={args.preset}  "
-          f"source={os.path.basename(args.src)}")
+    print("========================================================================\n"
+          "DEEP MEDIA MUTATION PIPELINE")
+    print(f"input={args.src}  seed={seed}  max=100min")
+    print(f"{args.ffmpeg} {compat.version_str} ({args.ffmpeg})")
     print(compat.summary())
 
-    # 1 ---- probe
-    print("[1/3] probing source ...")
-    probed = probe(args.src, ffprobe=args.ffprobe)
-    print(f"      {probed['width']}x{probed['height']} @ {probed['fps']} fps "
-          f"{probed['vcodec']} | audio: {probed['acodec'] or 'none'} "
-          f"{probed['sr']} Hz | {probed['duration']:.1f} s")
+    # 1 ---- probe source ----
+    probed = probe_media(args.src, ffprobe=args.ffprobe)
+    print(f"media: {probed['vcodec']} {probed['width']}x{probed['height']} "
+          f"@{probed['fps']:.2f}fps, {probed['duration']:.1f}s, "
+          f"audio={probed['acodec']} {probed['sr']}Hz")
+    low_cpu = os.cpu_count() < 4
+    print(f"runner profile: {'LOW' if low_cpu else 'FULL'} (os.cpu_count()={os.cpu_count()})")
 
-    # 2 ---- encode
-    print("[2/3] encode: audio disruption + video lattice (single pass) ...")
+    audio_out_sr = None
+    if args.odd_sr and probed["has_audio"]:
+        rng = random.Random(seed)
+        audio_out_sr = max(8000, min(192000, probed["sr"] + rng.randint(-220, 220)))
+        print(f"      audio track timescale mutation: {probed['sr']} -> {audio_out_sr} Hz")
+
+    # 2 ---- encode ----
     if args.print_graph:
-        print(build_combined_graph(probed, seed, args.preset, False, compat, None))
+        graph = build_combined_graph(probed, seed, args.preset, compat, audio_out_sr)
+        print(graph)
         return
+
     workdir = tempfile.mkdtemp(prefix="apfp_")
     inter = os.path.join(workdir, "stage12.mp4")
-    rc = encode_stage(args.src, inter, probed, seed, args.preset,
-                      args.ffmpeg, args.quiet, compat)
+    out_enc = os.path.join(workdir, "stage3.mp4")
+
+    print("[1/3] encode: audio disruption + video lattice ...")
+    rc, log = encode_stage(args.src, inter, probed, seed, args.preset,
+                           args.ffmpeg, args.quiet, compat, audio_out_sr)
     if rc != 0:
         sys.exit("encode stage failed")
 
-    # 3 ---- scrub signatures (no ftyp/free)
-    print("[3/3] scrubbing encoder signatures ...")
-    if not args.no_scrub:
-        scrubbed = scrub_signatures(inter)
-        print(f"      scrubbed {scrubbed} signature occurrences")
-    else:
-        scrubbed = 0
+    # 3 ---- container obfuscation ----
+    print("[2/3] container obfuscation ...")
+    # Simplified container ops
+    ftyp_report = sc.randomize_ftyp(inter, seed=seed)
+    scrubbed = sc.scrub_signatures(inter)
+    free_report = sc.inject_free_atom(inter, seed=seed)
 
-    # move to final output
+    print(f"  ftyp: {ftyp_report.get('major_brand_after', '?')} "
+          f"scrubbed={scrubbed} free={free_report.get('free_atom_size_bytes', 0)}")
+
+    # Move final output
     shutil.move(inter, args.out)
 
-    # 4 ---- verify
-    print("[4/3] verification ...")
-    ver = {"audio": None, "video_crc": None, "dhash": None}
+    # 4 ---- verify ----
+    print("[3/3] verification ...")
+    ver = {"audio": None, "video_crc": None, "dhash": None, "forensic": None}
+
     if probed["has_audio"] and fpcalc:
         ver["audio"] = audio_divergence(args.src, args.out, fpcalc)
         if ver["audio"]:
-            print(f"      fpcalc divergence : {ver['audio']['divergence']:.1%} "
+            print(f"      fpcalc divergence: {ver['audio']['divergence']:.1%} "
                   f"({ver['audio']['src_frames']} -> {ver['audio']['out_frames']} frames)")
         else:
             print("      fpcalc: no fingerprint frames extracted")
-    elif not fpcalc:
-        print("      fpcalc not found -> audio divergence SKIPPED")
 
     ver["video_crc"] = video_crc_divergence(args.src, args.out, args.ffmpeg)
     if ver["video_crc"]:
@@ -301,15 +325,14 @@ def main():
         print(f"      dHash mean distance: {ver['dhash']['mean']:.3f} "
               f"(>{THRESHOLDS['dhash_mean']} = broken, "
               f"{ver['dhash']['beyond_0.35']:.0%} beyond 0.35)")
-    else:
-        print("      dHash SKIPPED (pip install pillow imagehash)")
 
-    # forensic report (only signatures now)
-    sigs = scan_signatures(args.out)
-    if sigs:
-        print(f"      WARNING: remaining signatures: {sigs}")
+    # forensic
+    found = sc.scan_signatures(args.out)
+    ver["forensic"] = {"signatures_found": list(found.keys())}
+    if found:
+        print(f"      WARNING: signatures still present: {list(found.keys())}")
     else:
-        print("      forensic: no encoder signatures found")
+        print("      forensic: clean (no signatures)")
 
     # thresholds
     fails = []
@@ -319,6 +342,8 @@ def main():
         fails.append("framecrc divergence below threshold")
     if ver["dhash"] and ver["dhash"]["mean"] < THRESHOLDS["dhash_mean"]:
         fails.append("dHash distance below threshold")
+    if found:
+        fails.append(f"signatures: {list(found.keys())}")
 
     # manifest
     manifest = {
@@ -327,31 +352,34 @@ def main():
         "output": os.path.abspath(args.out),
         "seed": seed,
         "preset": args.preset,
-        "ffmpeg_compat": {
-            "major": compat.major,
-            "hue_eval": compat.hue_has_eval,
-            "scale_eval": compat.scale_has_eval,
-            "eq_eval": compat.eq_has_eval,
-            "filter_units": compat.has_filter_units,
-        },
+        "audio_out_sr": audio_out_sr,
         "probe": probed,
-        "container": {"scrubbed": scrubbed},
+        "ffmpeg_compat": {
+            "version": compat.version_str,
+            "scale_eval": compat.scale_eval,
+            "crop_eval": compat.crop_eval,
+            "firequalizer": compat.has("firequalizer"),
+        },
         "verification": ver,
-        "thresholds_met": not fails,
         "failures": fails,
+        "thresholds_met": not fails,
     }
+
     mpath = args.out + ".manifest.json"
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    if not args.keep_intermediate:
-        shutil.rmtree(workdir, ignore_errors=True)
-
-    print(f"\n== result: {'PASS' if not fails else 'FAIL'}")
+    print(f"\n== VERDICT: {'PASS' if not fails else 'FAIL'}")
     for msg in fails:
         print(f"   ! {msg}")
     print(f"   manifest: {mpath}")
-    sys.exit(0 if not fails else 1)
+    print(f"   output: {args.out}")
+
+    if not args.keep_intermediate:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    return 0 if not fails else 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
