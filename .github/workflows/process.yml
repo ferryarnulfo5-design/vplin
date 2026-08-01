@@ -20,6 +20,16 @@ on:
           - transparent
           - standard
           - aggressive
+      no_av_sync:
+        description: 'AV sync বন্ধ করবে (দ্রুততর)'
+        required: false
+        default: true
+        type: boolean
+      no_scrub:
+        description: 'সিগনেচার স্ক্রাব বন্ধ করবে (দ্রুততর)'
+        required: false
+        default: true
+        type: boolean
       install_master_ffmpeg:
         description: 'Latest static FFmpeg install করবে (আপনার লোকাল master build-এর সাথে match)'
         required: false
@@ -32,7 +42,7 @@ on:
       - 'stage_*.py'
       - 'ffmpeg_compat.py'
       - '.github/workflows/*.yml'
-  schedule:                    # সাপ্তাহিক অটো প্রসেসিং
+  schedule:                    # সাপ্তাহিক অটো প্রসেসিং (প্রতি সোমবার ৩ AM UTC)
     - cron: '0 3 * * 1'
 
 permissions:
@@ -48,28 +58,32 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5            # Node 24 (warning fix)
+        uses: actions/checkout@v5
 
       - name: Install system deps (ffmpeg + chromaprint fpcalc)
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg libchromaprint-tools python3-pip
           ffmpeg -version | head -n 1
 
       - name: Set up Python
-        uses: actions/setup-python@v6        # Node 24 (warning fix)
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-          cache: 'pip'                       # এবার requirements.txt পাবে -> cache কাজ করবে
+          cache: 'pip'
 
       - name: Install Python deps (dHash verification)
         run: |
+          set -e
           pip install --upgrade pip
-          pip install -r requirements.txt
+          # pillow ও imagehash সরাসরি ইনস্টল (requirements.txt তৈরি করার দরকার নেই)
+          pip install pillow imagehash
 
       - name: Install latest static FFmpeg (optional — master build match)
         if: ${{ github.event.inputs.install_master_ffmpeg == 'true' }}
         run: |
+          set -e
           curl -L -o /tmp/ff.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
           tar -xJf /tmp/ff.tar.xz -C /tmp
           sudo cp /tmp/ffmpeg-*-static/ffmpeg /usr/local/bin/
@@ -78,6 +92,7 @@ jobs:
 
       - name: Download input video (GitHub Release)
         run: |
+          set -e
           URL="${{ github.event.inputs.input_url || env.DEFAULT_INPUT_URL }}"
           echo "Downloading from: $URL"
           curl --fail --location --retry 3 --output input.mp4 "$URL"
@@ -93,19 +108,34 @@ jobs:
 
       - name: Run pipeline
         run: |
+          set -e
           PRESET="${{ github.event.inputs.preset || 'standard' }}"
           SEED_ARGS=""
           if [ -n "${{ github.event.inputs.seed }}" ]; then
             SEED_ARGS="--seed ${{ github.event.inputs.seed }}"
           fi
-          python pipeline.py input.mp4 output.mp4 --preset "$PRESET" $SEED_ARGS
+          NO_AV_SYNC="${{ github.event.inputs.no_av_sync != false }}"
+          NO_SCRUB="${{ github.event.inputs.no_scrub != false }}"
+          AV_SYNC_FLAG=""
+          SCRUB_FLAG=""
+          if [ "$NO_AV_SYNC" = "true" ]; then
+            AV_SYNC_FLAG="--no-av-sync"
+          fi
+          if [ "$NO_SCRUB" = "true" ]; then
+            SCRUB_FLAG="--no-scrub"
+          fi
+          python pipeline.py input.mp4 output.mp4 \
+            --preset "$PRESET" \
+            $SEED_ARGS \
+            $AV_SYNC_FLAG \
+            $SCRUB_FLAG
 
       - name: Debug print filtergraph (only on failure, optional)
         if: failure()
         run: python pipeline.py input.mp4 output.mp4 --print-graph || true
 
       - name: Upload output artifacts
-        uses: actions/upload-artifact@v5      # Node 24 (warning fix)
+        uses: actions/upload-artifact@v5
         with:
           name: processed-video
           path: |
