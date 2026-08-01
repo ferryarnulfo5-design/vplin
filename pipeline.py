@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-v4.0.2 Production-Grade Media Mutation Pipeline (Fixed for Video-Only Streams)
-Orchestrates FFmpeg capabilities detection, audio/video deformation filter chains,
-container obfuscation, and perceptual divergence verification.
+v4.0.3 Production-Grade Media Mutation Pipeline (Playability & Stream Fix)
 """
 
 import argparse
@@ -19,7 +17,6 @@ import stage_audio
 import stage_container
 import stage_video
 
-# Subprocess creation flags for Windows execution
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
@@ -55,7 +52,6 @@ def run_process_with_watchdog(
 
 
 def check_audio_presence(filepath: str) -> bool:
-    """Probes the media file to determine if an audio stream exists."""
     try:
         cmd = [
             "ffprobe", "-v", "error", "-select_streams", "a",
@@ -77,10 +73,8 @@ def verify_divergence(src: str, dst: str, compat: ffmpeg_compat.Capabilities) ->
         "ssim_val": 1.0,
         "verdict": "PASS",
     }
-    
     has_audio = check_audio_presence(src)
 
-    # 1. Chromaprint fpcalc audio divergence (Only if audio exists)
     if has_audio:
         try:
             p1 = subprocess.run(["fpcalc", "-raw", src], capture_output=True, text=True)
@@ -96,7 +90,6 @@ def verify_divergence(src: str, dst: str, compat: ffmpeg_compat.Capabilities) ->
         except Exception as e:
             print(f"[Warn] Chromaprint verification failed: {e}")
 
-    # 2. PSNR & SSIM verification with sampling (1 frame per 300)
     if compat.has("psnr") and compat.has("ssim"):
         try:
             log_psnr = "psnr.log"
@@ -107,56 +100,39 @@ def verify_divergence(src: str, dst: str, compat: ffmpeg_compat.Capabilities) ->
                 f"[main][ref]psnr=f={log_psnr},ssim=f={log_ssim}"
             )
             subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", dst, "-i", src,
-                    "-filter_complex", vf, "-f", "null", "-"
-                ],
+                ["ffmpeg", "-y", "-i", dst, "-i", src, "-filter_complex", vf, "-f", "null", "-"],
                 capture_output=True,
             )
-            
-            # Robust log parsing for PSNR
             if os.path.exists(log_psnr):
                 with open(log_psnr, "r") as f:
                     lines = [line.strip() for line in f.readlines() if line.strip()]
-                    if lines:
-                        last_line = lines[-1]
-                        if "average:" in last_line:
-                            psnr_val = float(last_line.split("average:")[1].split()[0])
-                            metrics["psnr_drop_db"] = round(max(0.0, 45.0 - psnr_val), 2)
-            
-            # Robust log parsing for SSIM
+                    if lines and "average:" in lines[-1]:
+                        psnr_val = float(lines[-1].split("average:")[1].split()[0])
+                        metrics["psnr_drop_db"] = round(max(0.0, 45.0 - psnr_val), 2)
             if os.path.exists(log_ssim):
                 with open(log_ssim, "r") as f:
                     lines = [line.strip() for line in f.readlines() if line.strip()]
-                    if lines:
-                        last_line = lines[-1]
-                        if "All:" in last_line:
-                            metrics["ssim_val"] = float(last_line.split("All:")[1].split()[0])
+                    if lines and "All:" in lines[-1]:
+                        metrics["ssim_val"] = float(lines[-1].split("All:")[1].split()[0])
         except Exception as e:
             print(f"[Warn] PSNR/SSIM calculation failed: {e}")
 
-    # 3. Visual dHash verification
     try:
         from PIL import Image
         import imagehash
-
         d_src = "tmp_src.jpg"
         d_dst = "tmp_dst.jpg"
         subprocess.run(["ffmpeg", "-y", "-i", src, "-vf", "select=eq(n\\,150)", "-vframes", "1", d_src], capture_output=True)
         subprocess.run(["ffmpeg", "-y", "-i", dst, "-vf", "select=eq(n\\,150)", "-vframes", "1", d_dst], capture_output=True)
-        
         if os.path.exists(d_src) and os.path.exists(d_dst):
             h1 = imagehash.dhash(Image.open(d_src))
             h2 = imagehash.dhash(Image.open(d_dst))
             metrics["dhash_mean_distance"] = round((h1 - h2) / 64.0, 3)
             os.remove(d_src)
             os.remove(d_dst)
-    except ImportError:
-        print("[Warn] PIL/imagehash missing, skipping dHash verification.")
     except Exception as e:
         print(f"[Warn] dHash check failed: {e}")
 
-    # QA Acceptance Criteria checks (Dynamic)
     if has_audio and metrics["audio_divergence_pct"] < 85.0:
         metrics["verdict"] = "FAIL"
     elif metrics["ssim_val"] > 0.85 or metrics["dhash_mean_distance"] < 0.35:
@@ -166,14 +142,10 @@ def verify_divergence(src: str, dst: str, compat: ffmpeg_compat.Capabilities) ->
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="v4.0.2 Media Mutation Pipeline")
+    parser = argparse.ArgumentParser(description="v4.0.3 Media Mutation Pipeline")
     parser.add_argument("input", help="Source multimedia file")
     parser.add_argument("output", help="Destination file")
-    parser.add_argument(
-        "--preset",
-        choices=["transparent", "standard", "aggressive"],
-        default="standard",
-    )
+    parser.add_argument("--preset", choices=["transparent", "standard", "aggressive"], default="standard")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--low-cpu", action="store_true", default=True)
     parser.add_argument("--verify", action="store_true")
@@ -183,10 +155,8 @@ def main() -> None:
     compat = ffmpeg_compat.probe_compat()
     print(f"[Compat] Detected FFmpeg v{compat.raw_version} (Major: {compat.major})")
 
-    # 1. Check for audio stream presence
     has_audio = check_audio_presence(args.input)
 
-    # 2. Build filter chains dynamically based on stream presence
     cmd_file = "chroma_cmd.txt"
     stage_video.generate_sendcmd_file(cmd_file, duration_sec=600.0)
     video_chain = stage_video.build_video_filterchain(
@@ -194,13 +164,11 @@ def main() -> None:
     )
 
     if has_audio:
-        print("[Info] Audio stream detected. Applying full A/V mutation.")
         audio_chain = stage_audio.build_audio_filterchain(compat, low_cpu=args.low_cpu, seed=args.seed)
         filter_complex = f"{audio_chain};[0:v]{video_chain}[vout]"
         map_args = ["-map", "[aout]", "-map", "[vout]"]
         audio_enc = ["-c:a", "aac", "-b:a", "128k"]
     else:
-        print("[Info] No audio stream detected. Applying Video-only mutation.")
         filter_complex = f"[0:v]{video_chain}[vout]"
         map_args = ["-map", "[vout]"]
         audio_enc = []
@@ -212,16 +180,16 @@ def main() -> None:
         "ffmpeg", "-y", "-i", args.input,
         "-filter_complex", filter_complex,
     ] + map_args + vsync_args + [
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23"
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p"  # Ensures universal player compatibility
     ] + audio_enc + [intermediate_file]
 
     code, log = run_process_with_watchdog(ffmpeg_cmd)
     if code != 0:
-        print("[Error] FFmpeg pipeline failed:")
-        print(log)
+        print("[Error] FFmpeg pipeline failed:\n", log)
         sys.exit(1)
 
-    print("[Container] Randomizing ftyp, scrubbing signatures, and injecting free atom...")
+    print("[Container] Obfuscating container safely...")
     shutil.copyfile(intermediate_file, args.output)
     ftyp_data = stage_container.randomize_ftyp(args.output, seed=args.seed)
     scrub_data = stage_container.scrub_signatures(args.output, [b"Lavf", b"HandBrake", b"Xiph"])
@@ -230,7 +198,6 @@ def main() -> None:
 
     verify_metrics = {}
     if args.verify:
-        print("[Verify] Analyzing perceptual divergence metrics...")
         verify_metrics = verify_divergence(args.input, args.output, compat)
 
     manifest = {
@@ -257,8 +224,6 @@ def main() -> None:
         os.remove(intermediate_file)
 
     print("[Done] Pipeline processing finished successfully.")
-    if args.verify:
-        print(f"  -> QA Verdict: {verify_metrics.get('verdict')}")
 
 
 if __name__ == "__main__":
