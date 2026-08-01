@@ -1,0 +1,11 @@
+# outputs কখনো commit হবে না — Artifacts দিয়ে ডাউনলোড হয়
+output.mp4
+output.mp4.manifest.json
+stage12.mp4
+
+# input এখন GitHub Release থেকে আসে
+input.mp4
+
+__pycache__/
+*.pyc
+.venv/
