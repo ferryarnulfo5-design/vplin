@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 stage_container.py -- Deep container & stream obfuscation (hex-level surgery).
-Fixed: robust ftyp handling, no strict offset assumptions.
+Ultra-robust: handles corrupted ftyp brands, missing boxes, and binary data.
 """
 from __future__ import annotations
 
@@ -10,9 +10,7 @@ import os
 import random
 import struct
 import hashlib
-import tempfile
-import shutil
-from typing import Dict, List, Optional, Tuple, BinaryIO
+from typing import Dict, List, Optional, Tuple
 
 # ----------------------------------------------------------------------
 # Forensic signatures to scrub (byte strings)
@@ -61,41 +59,38 @@ def scrub_signatures(path: str) -> int:
     return replaced
 
 # ----------------------------------------------------------------------
-# 2) ftyp randomization (robust: works even if ftyp is missing)
+# 2) ftyp randomization (robust: no Unicode decode errors)
 # ----------------------------------------------------------------------
 def randomize_ftyp(path: str, seed: Optional[int] = None,
                    profile_idx: Optional[int] = None) -> Dict:
-    """Rewrite ftyp to mimic a hardware recorder. Creates ftyp if missing."""
+    """Rewrite ftyp to mimic a hardware recorder. Handles binary brand bytes."""
     rng = random.Random(seed)
     
     with open(path, "r+b") as fh:
         data = bytearray(fh.read())
-        # Look for 'ftyp' signature
         ftyp_offset = data.find(b"ftyp")
         
         if ftyp_offset == -1:
-            # No ftyp found! Create a new one and prepend.
+            # No ftyp, create one
             if profile_idx is None:
                 profile_idx = rng.randrange(len(DEVICE_PROFILES))
             major, minor, brands = DEVICE_PROFILES[profile_idx]
             major = major.encode('ascii')
-            brands_bytes = [b.encode('ascii') if isinstance(b, str) else b for b in brands[:4]]
-            # Ensure at least 4 brands (pad with isom)
+            brands_bytes = [b.encode('ascii') for b in brands[:4]]
             while len(brands_bytes) < 4:
                 brands_bytes.append(b"isom")
             ftyp_box = b"ftyp" + major + struct.pack(">I", minor) + b"".join(brands_bytes[:4])
-            # Prepend
             fh.seek(0)
             fh.write(ftyp_box + bytes(data))
             fh.flush()
             return {
-                "major_brand_after": major.decode("latin1"),
+                "major_brand_after": major.decode('latin1'),
                 "minor_version_after": minor,
-                "compatible_brands_after": [b.decode("latin1") for b in brands_bytes[:4]],
-                "note": "ftyp was missing, created new one"
+                "compatible_brands_after": [b.decode('latin1') for b in brands_bytes[:4]],
+                "note": "ftyp missing, created new one"
             }
         
-        # ftyp exists, parse it
+        # Parse ftyp size
         size = struct.unpack(">I", data[ftyp_offset:ftyp_offset+4])[0]
         if size == 1:
             size = struct.unpack(">Q", data[ftyp_offset+8:ftyp_offset+16])[0]
@@ -109,27 +104,36 @@ def randomize_ftyp(path: str, seed: Optional[int] = None,
         pos = ftyp_offset + 12
         while pos < ftyp_offset + size:
             if pos + 4 <= len(data):
-                brands_before.append(data[pos:pos+4])
+                brands_before.append(bytes(data[pos:pos+4]))
                 pos += 4
             else:
                 break
         
-        n = len(brands_before)
-        if n < 1:
-            n = 4
+        n = max(1, len(brands_before))
         
         if profile_idx is None:
             profile_idx = rng.randrange(len(DEVICE_PROFILES))
         major_new, minor_new, profile_brands = DEVICE_PROFILES[profile_idx]
         major_new = major_new.encode('ascii')
         
-        # Build new brands
+        # Build new brands - use bytes everywhere, no decode
         brands_new: List[bytes] = []
-        pool = list(dict.fromkeys(profile_brands + [b.decode() for b in brands_before] + _BRAND_POOL))
-        pool_bytes = [b.encode('ascii') if isinstance(b, str) else b for b in pool]
+        # Start with profile brands
+        pool = [b.encode('ascii') for b in profile_brands]
+        # Add existing brands (as bytes)
+        for b in brands_before:
+            if b not in pool:
+                pool.append(b)
+        # Add fallback pool
+        for b in _BRAND_POOL:
+            bbytes = b.encode('ascii')
+            if bbytes not in pool:
+                pool.append(bbytes)
+        
+        # Randomly pick n brands from pool
         for _ in range(n):
-            if pool_bytes:
-                chosen = pool_bytes.pop(rng.randrange(len(pool_bytes)))
+            if pool:
+                chosen = pool.pop(rng.randrange(len(pool)))
                 brands_new.append(chosen)
             else:
                 brands_new.append(b"isom")
@@ -137,29 +141,27 @@ def randomize_ftyp(path: str, seed: Optional[int] = None,
         
         # Create new ftyp box
         new_ftyp = b"ftyp" + major_new + struct.pack(">I", minor_new) + b"".join(brands_new)
-        # Pad if needed
         while len(new_ftyp) < size:
             new_ftyp += b" "
         if len(new_ftyp) > size:
             new_ftyp = new_ftyp[:size]
         
-        # Write back
         fh.seek(ftyp_offset)
         fh.write(new_ftyp)
         fh.flush()
         
     return {
-        "major_brand_before": major_before.decode("latin1"),
-        "major_brand_after": major_new.decode("latin1"),
+        "major_brand_before": major_before.decode('latin1', errors='replace'),
+        "major_brand_after": major_new.decode('latin1'),
         "minor_version_before": minor_before,
         "minor_version_after": minor_new,
-        "compatible_brands_before": [b.decode("latin1") for b in brands_before[:6]],
-        "compatible_brands_after": [b.decode("latin1") for b in brands_new[:6]],
+        "compatible_brands_before": [b.decode('latin1', errors='replace') for b in brands_before[:6]],
+        "compatible_brands_after": [b.decode('latin1', errors='replace') for b in brands_new[:6]],
         "profile": DEVICE_PROFILES[profile_idx][0].strip(),
     }
 
 # ----------------------------------------------------------------------
-# 3) free-atom injection (robust: finds ftyp even if not at offset 0)
+# 3) free-atom injection (simplified, robust)
 # ----------------------------------------------------------------------
 def inject_free_atom(path: str, seed: Optional[int] = None, max_padding: int = 128) -> Dict:
     """Insert a random free box after ftyp; patch stco/co64 offsets."""
@@ -170,48 +172,33 @@ def inject_free_atom(path: str, seed: Optional[int] = None, max_padding: int = 1
     
     with open(path, "r+b") as fh:
         data = bytearray(fh.read())
-        # Find ftyp offset
         ftyp_offset = data.find(b"ftyp")
         if ftyp_offset == -1:
-            # No ftyp, create one
+            # No ftyp, just prepend
             ftyp_box = b"ftyp" + b"isom" + struct.pack(">I", 0) + b"isom" + b"mp42" + b"avc1"
-            ftyp_offset = 0
             fh.seek(0)
             fh.write(ftyp_box + free_box + bytes(data))
             fh.flush()
-            return {
-                "free_atom_size_bytes": delta,
-                "padding_bytes": padding,
-                "note": "ftyp missing, created new one with free atom"
-            }
+            return {"free_atom_size_bytes": delta, "padding_bytes": padding, "note": "ftyp created"}
         
-        # Read ftyp size
         size = struct.unpack(">I", data[ftyp_offset:ftyp_offset+4])[0]
         if size == 1:
             size = struct.unpack(">Q", data[ftyp_offset+8:ftyp_offset+16])[0]
-            header_len = 16
-        else:
-            header_len = 8
         
-        # Extract ftyp data
         ftyp_data = data[ftyp_offset:ftyp_offset+size]
         rest = data[ftyp_offset+size:]
-        
-        # Write: ftyp + free_box + rest
         fh.seek(ftyp_offset)
         fh.write(ftyp_data)
         fh.write(free_box)
         fh.write(rest)
         fh.flush()
     
-    # Now patch stco/co64 offsets by adding delta to chunk offsets
-    # Use a simple but robust approach: read whole file as bytearray and fix offsets
+    # Patch stco/co64 offsets
     with open(path, "r+b") as fh:
         data = bytearray(fh.read())
-        # Find all stco boxes
+        # stco
         pos = data.find(b"stco")
         while pos != -1:
-            # stco: 4 bytes size + 4 bytes 'stco' + 4 bytes version/flags + 4 bytes entry_count
             if pos + 12 <= len(data):
                 cnt = struct.unpack(">I", data[pos+8:pos+12])[0]
                 p = pos + 12
@@ -222,7 +209,7 @@ def inject_free_atom(path: str, seed: Optional[int] = None, max_padding: int = 1
                         p += 4
             pos = data.find(b"stco", pos + 1)
         
-        # Find all co64 boxes
+        # co64
         pos = data.find(b"co64")
         while pos != -1:
             if pos + 12 <= len(data):
@@ -239,19 +226,7 @@ def inject_free_atom(path: str, seed: Optional[int] = None, max_padding: int = 1
         fh.write(data)
         fh.flush()
     
-    # Get mdat size (optional)
-    mdat_size = None
-    with open(path, "rb") as fh:
-        data = fh.read()
-        pos = data.find(b"mdat")
-        if pos != -1 and pos + 8 <= len(data):
-            mdat_size = struct.unpack(">I", data[pos:pos+4])[0]
-    
-    return {
-        "free_atom_size_bytes": delta,
-        "padding_bytes": padding,
-        "mdat_size_after_bytes": mdat_size,
-    }
+    return {"free_atom_size_bytes": delta, "padding_bytes": padding}
 
 # ----------------------------------------------------------------------
 # 4) Verify
