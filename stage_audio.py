@@ -26,19 +26,17 @@ def _static_eq() -> str:
     )
 
 def _fq_swept_notch() -> str:
-    """Firequalizer with time‑varying swept notch (if filter exists)."""
+    """Firequalizer with time‑varying swept notch - minimal options only."""
     return (
         "firequalizer="
-        "gain='if(lt(mod(pts*tb,20),10),-6*sin(f/1200),-1.5)':"
-        "fscale=lin:fir=1:fir_size=2048:zero_phase=0"
+        "gain='if(lt(mod(pts*tb,20),10),-6*sin(f/1200),-1.5)'"
     )
 
 def _fq_wobble() -> str:
     """Optional slow sinusoidal wobble on top of the swept notch."""
     return (
         "firequalizer="
-        "gain='2.5*sin(2*PI*pts*tb/9)*sin(f/700)':"
-        "fscale=lin:fir=1:fir_size=2048:zero_phase=0"
+        "gain='2.5*sin(2*PI*pts*tb/9)*sin(f/700)'"
     )
 
 # ----------------------------------------------------------------------
@@ -59,7 +57,6 @@ def _modulation(caps: Capabilities) -> str:
     if caps.has("aphaser"):
         chain.append("aphaser=type=sinusoidal:decay=0.4:speed=0.6")
     if caps.has("chorus"):
-        # Use named options if available, otherwise fallback to positional
         if caps.opt("chorus", "delays"):
             chain.append(
                 "chorus=in_gain=0.5:out_gain=0.7:"
@@ -99,6 +96,7 @@ def build_audio_filtergraph(
 ) -> str:
     """Return the full audio filter_complex fragment ending in [aout]."""
     pre: List[str] = []
+    
     # ------------------------------------------------------------------
     # L1 + L2: frequency‑domain EQ
     # - If firequalizer exists and we are not in low_cpu mode, use it.
