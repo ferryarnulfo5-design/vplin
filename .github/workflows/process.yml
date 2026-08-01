@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5            # Node 24 (warning fix)
 
       - name: Install system deps (ffmpeg + chromaprint fpcalc)
         run: |
@@ -57,15 +57,15 @@ jobs:
           ffmpeg -version | head -n 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6        # Node 24 (warning fix)
         with:
           python-version: '3.12'
-          cache: 'pip'
+          cache: 'pip'                       # এবার requirements.txt পাবে -> cache কাজ করবে
 
-      - name: Install Python deps (optional dHash verification)
+      - name: Install Python deps (dHash verification)
         run: |
           pip install --upgrade pip
-          pip install pillow imagehash
+          pip install -r requirements.txt
 
       - name: Install latest static FFmpeg (optional — master build match)
         if: ${{ github.event.inputs.install_master_ffmpeg == 'true' }}
@@ -105,7 +105,7 @@ jobs:
         run: python pipeline.py input.mp4 output.mp4 --print-graph || true
 
       - name: Upload output artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5      # Node 24 (warning fix)
         with:
           name: processed-video
           path: |
